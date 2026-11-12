@@ -24,16 +24,48 @@ const ollama = require('./config/ollama');
 
 const LLM_CONFIG = {
     model: process.env.OLLAMA_MODEL || 'qwen3.5:4b',
-    timeoutMs: 60000,            // Tiempo máximo de espera por respuesta del modelo
-    minNewChars: 150,            // Texto nuevo mínimo para volver a evaluar
-    maxPromptChars: 2500,        // Máximo de texto "nuevo" enviado al modelo
-    recentContextChars: 1000,    // Cola de contexto ya revisado, solo como referencia
-    maxQuestionHistory: 15,      // Preguntas previas que se le recuerdan al modelo
-    minQuestionWords: 4,
-    maxQuestionWords: 40,
-    maxQuestionChars: 300,
-    similarityThreshold: 0.7,    // Similitud (Jaccard) a partir de la cual es duplicada
-    noContextToken: 'SIN_CONTEXTO'
+    fastModel: process.env.OLLAMA_FAST_MODEL || process.env.OLLAMA_MODEL || 'qwen3.5:4b',
+    timeoutMs: 45000,            // Tiempo máximo de espera por respuesta del modelo
+    keepAlive: '60m',            // Mantiene el modelo cargado en memoria
+    numCtx: 4096,                // Igual en todas las llamadas (ver nota arriba)
+    similarityThreshold: 0.7,    // Similitud (Jaccard) a partir de la cual algo es duplicado
+    noContextToken: 'SIN_CONTEXTO',
+    nothingToken: 'NADA',
+
+    // -- Carril de preguntas --
+    questions: {
+        minNewChars: 70,         // Texto nuevo mínimo para volver a evaluar
+        maxNewChars: 1800,       // Máximo de texto "nuevo" enviado al modelo
+        recentContextChars: 1500,// Cola de contexto ya revisado, solo como referencia
+        maxHistory: 15,          // Preguntas previas que se le recuerdan al modelo
+        numPredict: 260,
+        temperature: 0.3,
+        minWords: 4,
+        maxWords: 40,
+        maxChars: 300
+    },
+
+    // -- Carril de objeciones (el más sensible al tiempo) --
+    objections: {
+        minChars: 20,            // Intervención mínima para evaluarla
+        earlyMinChars: 25,       // Mínimo para evaluar una pregunta aún en curso (parcial)
+        recentContextChars: 700,
+        maxTextChars: 700,
+        maxPerTurn: 2,
+        numPredict: 140,
+        temperature: 0.1
+    },
+
+    // -- Carril de contradicciones y datos clave --
+    insights: {
+        minNewChars: 90,
+        maxNewChars: 1500,
+        historyChars: 2500,      // Lo dicho antes, contra lo que se compara el texto nuevo
+        maxReported: 10,         // Hallazgos previos que se le recuerdan al modelo
+        maxPerTurn: 3,
+        numPredict: 220,
+        temperature: 0.2
+    }
 };
 
 // =================== Configuración de autenticación ===================
@@ -90,46 +122,137 @@ const handleError = (res, error, fallbackMessage) => {
     return res.status(500).json({ error: fallbackMessage });
 };
 
-// =================== Prompt del LLM ===================
-// -- Instrucciones fijas: el modelo responde SOLO con la pregunta o con el token de "sin contexto" --
-const SYSTEM_PROMPT = `Eres un asistente de apoyo para un abogado que participa en una audiencia judicial.
-Recibes fragmentos de la transcripción automática de la audiencia. Pueden contener errores de reconocimiento y no indican quién habla.
+// =================== Tipos de audiencia ===================
+const AUDIENCE_TYPES = ['penal', 'civil', 'laboral', 'administrativo'];
+const DEFAULT_AUDIENCE_TYPE = 'penal';
+const JURISDICTION = process.env.APP_JURISDICTION || 'Colombia';
 
-Tu única tarea es proponer UNA pregunta que el abogado pueda formular a continuación.
+// =================== Prompts base por tipo de audiencia ===================
+// -- Aquí solo vive lo que cambia según el tipo de juicio: el rol y el enfoque del asistente. --
+// -- Puedes detallar estos cuatro textos sin tocar nada más: el formato de salida que el sistema --
+// -- necesita se agrega aparte (ver INSTRUCCIONES_* más abajo), así no se rompe al editarlos. --
+const PROMPTS_POR_TIPO = {
+    penal: `Eres un asistente de apoyo en tiempo real para un abogado que participa en una audiencia PENAL en ${JURISDICTION} (fiscalía, defensa, víctima, testigos, peritos y juez).
+Tu enfoque: los hechos y sus circunstancias de tiempo, modo y lugar; la fuente del conocimiento del testigo (si vio, oyó o le contaron); la coherencia y credibilidad de los testimonios; la identificación de personas y objetos; la cadena de custodia y las pruebas; la teoría del caso (tipicidad, antijuridicidad, culpabilidad) y las garantías procesales.`,
 
-Reglas:
-1. Responde únicamente con la pregunta, en una sola línea, en español y entre signos de interrogación. No incluyas saludos, numeración, comillas, explicaciones ni formato.
-2. Basa la pregunta solo en hechos, afirmaciones o contradicciones presentes en el texto NUEVO. El texto de CONTEXTO PREVIO es solo referencia. Nunca inventes nombres, fechas, lugares ni hechos.
-3. La pregunta debe ser concreta y útil: aclarar, precisar, verificar o cuestionar lo dicho (tiempo, modo, lugar, fuente del conocimiento, coherencia). Prefiere preguntas abiertas.
-4. No repitas ni reformules ninguna de las preguntas ya sugeridas.
-5. Si el texto NUEVO solo tiene saludos, identificaciones, trámites, frases sueltas o información que no permita una pregunta útil, responde exactamente: ${LLM_CONFIG.noContextToken}
-6. Máximo ${LLM_CONFIG.maxQuestionWords} palabras.`;
+    civil: `Eres un asistente de apoyo en tiempo real para un abogado que participa en una audiencia CIVIL en ${JURISDICTION} (demandante, demandado, apoderados, testigos, peritos y juez).
+Tu enfoque: la existencia y el contenido de la obligación o del contrato; el incumplimiento y sus causas; los pagos y los documentos que los acreditan; los daños y su cuantía; el nexo causal; la carga de la prueba; las excepciones (prescripción, pago, mala fe) y las pretensiones y defensas de cada parte.`,
 
-/**
- * Construye el mensaje de usuario con el contexto actual de la audiencia.
- * Se arma con un arreglo para que la indentación del código no ensucie el prompt.
- */
-const buildUserPrompt = ({ caseName, caseDescription, recentContext, askedQuestions, newText }) => {
-    const previous = askedQuestions.length
-        ? askedQuestions.map((q) => `- ${q}`).join('\n')
-        : '(ninguna)';
+    laboral: `Eres un asistente de apoyo en tiempo real para un abogado que participa en una audiencia LABORAL en ${JURISDICTION} (trabajador, empleador, apoderados, testigos y juez).
+Tu enfoque: la existencia de la relación laboral y sus elementos (prestación personal del servicio, subordinación, salario); la jornada y las horas extras; el pago de salarios, prestaciones y aportes a seguridad social; la terminación del contrato (justa causa, despido, indemnización); los accidentes y riesgos laborales; y la prueba de cada punto (documentos y testigos).`,
 
-    return [
-        `CASO: ${caseName || 'Sin título'}`,
-        caseDescription ? `DESCRIPCIÓN: ${caseDescription}` : null,
-        `CONTEXTO PREVIO: ${recentContext || '(ninguno)'}`,
-        'PREGUNTAS YA SUGERIDAS:',
-        previous,
-        `TEXTO NUEVO: ${newText}`
-    ].filter(Boolean).join('\n');
+    administrativo: `Eres un asistente de apoyo en tiempo real para un abogado que participa en una audiencia ADMINISTRATIVA en ${JURISDICTION} (particular o demandante, entidad pública, apoderados, testigos, peritos y juez o magistrado).
+Tu enfoque: el acto, hecho, omisión u operación administrativa discutida; la competencia y la legalidad (motivación, debido proceso, desviación de poder); la falla del servicio, el daño antijurídico y el nexo causal; la actuación de la entidad y los documentos del expediente administrativo; la oportunidad (caducidad) y las pretensiones (nulidad y restablecimiento del derecho, reparación directa, controversias contractuales).`
 };
 
-// -- Ejemplos de comportamiento esperado (few-shot) para mantener el formato estable --
-const FEW_SHOT_MESSAGES = [
+// -- Nota común sobre la calidad de la transcripción (aplica a todos los tipos y carriles) --
+const TRANSCRIPTION_NOTES = `Sobre la transcripción:
+- Es automática, en vivo y no indica quién habla. Puede tener palabras mal reconocidas (homófonos, nombres propios deformados, cifras o fechas mal escritas, frases cortadas o sin puntuación).
+- Interpreta por el sentido del contexto y deduce quién habla (juez, fiscal o abogado, testigo, parte) a partir de lo que dice. Haz el mayor esfuerzo por entender lo que se quiso decir.
+- Si una palabra dudosa cambia el sentido de un hecho importante, no la des por cierta.
+- Nunca inventes nombres, fechas, lugares ni hechos que no estén en el texto.`;
+
+// -- Instrucciones de formato por carril: no dependen del tipo de audiencia --
+const INSTRUCCIONES_PREGUNTAS = `Tu tarea: proponer UNA pregunta que el abogado pueda formular a continuación, junto con dos versiones alternativas.
+
+Responde con UNA sola línea JSON, sin markdown ni texto adicional:
+{"q":"<mejor versión>","directa":"<versión más directa o cerrada>","abierta":"<versión más abierta>","enfoque":"<aclarar|precisar|verificar|cuestionar|profundizar>","porque":"<motivo en máximo 12 palabras>"}
+
+Reglas:
+1. Cada pregunta va en español, entre signos de interrogación, y es UNA sola pregunta (nunca compuesta). Máximo ${LLM_CONFIG.questions.maxWords} palabras cada una.
+2. Basa las preguntas solo en hechos, afirmaciones o contradicciones presentes en el TEXTO NUEVO. El CONTEXTO PREVIO es solo referencia.
+3. Deben ser concretas y útiles: aclarar, precisar, verificar o cuestionar lo dicho (tiempo, modo, lugar, fuente del conocimiento, coherencia). No uses preguntas capciosas ni especulativas, y evita las sugestivas.
+4. "q" es la mejor de las tres. Las tres deben ser realmente distintas entre sí.
+5. No repitas ni reformules ninguna de las PREGUNTAS YA SUGERIDAS.
+6. Si el TEXTO NUEVO solo tiene saludos, identificaciones, trámites, frases sueltas o información que no permita una pregunta útil, responde exactamente: ${LLM_CONFIG.noContextToken}`;
+
+const INSTRUCCIONES_OBJECIONES = `Tu tarea: detectar, en la ÚLTIMA INTERVENCIÓN, preguntas formuladas en voz alta que merezcan una objeción. Solo evalúas preguntas (no respuestas ni afirmaciones).
+
+Tipos de objeción (usa exactamente el identificador):
+- capciosa: utiliza engaño, artificio o inducción a error para lograr que el testigo responda algo que no desea o que es falso.
+- sugestiva: sugiere o insinúa la respuesta dentro de la misma pregunta (ej.: "¿Es verdad que usted vio al acusado salir corriendo a las 8:00 PM?").
+- impertinente: no guarda relación con los hechos del debate ni con la teoría del caso; no aporta información útil para resolver el litigio.
+- ambigua: es tan imprecisa, confusa o vaga que el testigo no puede entender qué se le pregunta.
+- compuesta: contiene dos o más preguntas en una sola (ej.: "¿Dónde estaba usted a las 8:00 y qué llevaba puesto?").
+- repetitiva: insiste sobre un punto que ya fue respondido, sin aportar elementos nuevos (verifícalo con el CONTEXTO RECIENTE).
+- especulativa: pide al testigo suponer, imaginar o conjeturar sobre hechos que no le constan directamente.
+
+Responde con una línea JSON por objeción (máximo ${LLM_CONFIG.objections.maxPerTurn}), sin markdown ni texto adicional:
+{"t":"<identificador>","cita":"<la pregunta tal como se transcribió, máximo 25 palabras>","motivo":"<por qué procede, máximo 14 palabras>"}
+
+Reglas:
+1. Señala solo cuando sea claro. Ante la duda, responde exactamente: ${LLM_CONFIG.nothingToken}
+2. Si la intervención no contiene ninguna pregunta objetable, responde exactamente: ${LLM_CONFIG.nothingToken}
+3. Un error de transcripción no es motivo de objeción.`;
+
+const INSTRUCCIONES_HALLAZGOS = `Tu tarea: revisar el TEXTO NUEVO, comparándolo con el HISTORIAL, para detectar dos cosas:
+- contradiccion: el texto nuevo contradice o es inconsistente con algo dicho antes (por la misma persona o entre declarantes) en hechos, fechas, horas, lugares, cantidades o versiones.
+- dato: un dato importante para el caso que el abogado debe tener presente (fecha, hora, lugar, persona, cantidad, documento, objeto o relación entre personas).
+
+Responde con una línea JSON por hallazgo (máximo ${LLM_CONFIG.insights.maxPerTurn}), sin markdown ni texto adicional:
+{"k":"contradiccion","titulo":"<máximo 6 palabras>","antes":"<lo dicho antes, máximo 20 palabras>","ahora":"<lo dicho ahora, máximo 20 palabras>","detalle":"<por qué se contradicen, máximo 20 palabras>"}
+{"k":"dato","titulo":"<tipo de dato, máximo 4 palabras>","detalle":"<el dato concreto, máximo 20 palabras>"}
+
+Reglas:
+1. Reporta contradicciones solo si son reales. Una diferencia causada por un posible error de transcripción NO es una contradicción.
+2. Reporta únicamente datos relevantes para el caso; ignora saludos, trámites y frases sin contenido.
+3. No repitas los HALLAZGOS YA REPORTADOS.
+4. Si no hay nada que reportar, responde exactamente: ${LLM_CONFIG.nothingToken}`;
+
+/**
+ * Arma el prompt de sistema de cada carril: rol del tipo de audiencia + nota de
+ * transcripción + formato del carril.
+ */
+const buildSystemPrompts = (tipo) => {
+    const domain = PROMPTS_POR_TIPO[tipo] || PROMPTS_POR_TIPO[DEFAULT_AUDIENCE_TYPE];
+    const compose = (instructions) => `${domain}\n\n${TRANSCRIPTION_NOTES}\n\n${instructions}`;
+
+    return {
+        questions: compose(INSTRUCCIONES_PREGUNTAS),
+        objections: compose(INSTRUCCIONES_OBJECIONES),
+        insights: compose(INSTRUCCIONES_HALLAZGOS)
+    };
+};
+
+// =================== Mensajes de usuario por carril ===================
+const caseHeader = (caseName, caseDescription) => [
+    `CASO: ${caseName || 'Sin título'}`,
+    caseDescription ? `DESCRIPCIÓN: ${String(caseDescription).slice(0, 600)}` : null
+];
+
+const buildQuestionsPrompt = ({ caseName, caseDescription, recentContext, askedQuestions, newText }) =>
+    [
+        ...caseHeader(caseName, caseDescription),
+        `CONTEXTO PREVIO: ${recentContext || '(ninguno)'}`,
+        'PREGUNTAS YA SUGERIDAS:',
+        askedQuestions.length ? askedQuestions.map((q) => `- ${q}`).join('\n') : '(ninguna)',
+        `TEXTO NUEVO: ${newText}`
+    ].filter(Boolean).join('\n');
+
+const buildObjectionsPrompt = ({ caseName, caseDescription, recentContext, lastTurn }) =>
+    [
+        ...caseHeader(caseName, caseDescription),
+        `CONTEXTO RECIENTE: ${recentContext || '(ninguno)'}`,
+        `ÚLTIMA INTERVENCIÓN: ${lastTurn}`
+    ].filter(Boolean).join('\n');
+
+const buildInsightsPrompt = ({ caseName, caseDescription, history, reported, newText }) =>
+    [
+        ...caseHeader(caseName, caseDescription),
+        `HISTORIAL: ${history || '(ninguno)'}`,
+        'HALLAZGOS YA REPORTADOS:',
+        reported.length ? reported.map((r) => `- ${r}`).join('\n') : '(ninguno)',
+        `TEXTO NUEVO: ${newText}`
+    ].filter(Boolean).join('\n');
+
+// -- Ejemplos (few-shot) por carril: fijan el formato y son neutros respecto al tipo de audiencia --
+const EXAMPLE_CASE = 'Caso de ejemplo';
+
+const QUESTIONS_FEW_SHOT = [
     {
         role: 'user',
-        content: buildUserPrompt({
-            caseName: 'Hurto en establecimiento comercial',
+        content: buildQuestionsPrompt({
+            caseName: EXAMPLE_CASE,
             recentContext: '',
             askedQuestions: [],
             newText: 'Buenos días, señoría. Me presento, soy el testigo, vivo en el barrio San José y fui citado para declarar en esta audiencia.'
@@ -138,8 +261,8 @@ const FEW_SHOT_MESSAGES = [
     { role: 'assistant', content: LLM_CONFIG.noContextToken },
     {
         role: 'user',
-        content: buildUserPrompt({
-            caseName: 'Hurto en establecimiento comercial',
+        content: buildQuestionsPrompt({
+            caseName: EXAMPLE_CASE,
             recentContext: '',
             askedQuestions: [],
             newText: 'Yo vi cuando el señor salió corriendo de la tienda con una caja en la mano. Eso fue como a las nueve de la noche, yo estaba en la esquina esperando un bus y no alcancé a verle bien la cara.'
@@ -147,45 +270,154 @@ const FEW_SHOT_MESSAGES = [
     },
     {
         role: 'assistant',
-        content: '¿Qué características físicas o de vestimenta pudo observar en la persona que salió corriendo, aunque no alcanzara a ver su rostro?'
+        content: JSON.stringify({
+            q: '¿Qué características físicas o de vestimenta pudo observar en la persona que salió corriendo, aunque no alcanzara a ver su rostro?',
+            directa: '¿Recuerda de qué color era la ropa de la persona que salió corriendo?',
+            abierta: '¿Cómo describiría a la persona que vio salir de la tienda?',
+            enfoque: 'precisar',
+            porque: 'Dijo que no vio la cara; falta saber cómo identificó a la persona.'
+        })
     }
+];
+
+const OBJECTIONS_FEW_SHOT = [
+    {
+        role: 'user',
+        content: buildObjectionsPrompt({
+            caseName: EXAMPLE_CASE,
+            recentContext: '',
+            lastTurn: 'Buenos días, señor testigo. ¿Podría decirnos su nombre completo y a qué se dedica?'
+        })
+    },
+    { role: 'assistant', content: LLM_CONFIG.nothingToken },
+    {
+        role: 'user',
+        content: buildObjectionsPrompt({
+            caseName: EXAMPLE_CASE,
+            recentContext: 'Yo estaba en la esquina esperando un bus.',
+            lastTurn: '¿Es cierto que usted vio al señor salir corriendo de la tienda a las nueve de la noche con la caja en la mano?'
+        })
+    },
+    {
+        role: 'assistant',
+        content: JSON.stringify({
+            t: 'sugestiva',
+            cita: '¿Es cierto que usted vio al señor salir corriendo de la tienda a las nueve de la noche con la caja en la mano?',
+            motivo: 'La pregunta ya trae incluida la respuesta que se espera.'
+        })
+    },
+    {
+        role: 'user',
+        content: buildObjectionsPrompt({
+            caseName: EXAMPLE_CASE,
+            recentContext: '',
+            lastTurn: 'Dígame, ¿dónde estaba usted a las ocho y qué llevaba puesto ese día?'
+        })
+    },
+    {
+        role: 'assistant',
+        content: JSON.stringify({
+            t: 'compuesta',
+            cita: '¿Dónde estaba usted a las ocho y qué llevaba puesto ese día?',
+            motivo: 'Contiene dos preguntas distintas en una sola.'
+        })
+    }
+];
+
+const INSIGHTS_FEW_SHOT = [
+    {
+        role: 'user',
+        content: buildInsightsPrompt({
+            caseName: EXAMPLE_CASE,
+            history: 'Yo vi al señor salir de la tienda como a las nueve de la noche.',
+            reported: [],
+            newText: 'Cuando eso pasó yo ya estaba en mi casa desde las siete, me enteré al otro día por una vecina.'
+        })
+    },
+    {
+        role: 'assistant',
+        content: JSON.stringify({
+            k: 'contradiccion',
+            titulo: 'Presencia en el lugar',
+            antes: 'Vio al señor salir de la tienda a las nueve de la noche.',
+            ahora: 'Estaba en su casa desde las siete y se enteró al día siguiente.',
+            detalle: 'Primero dice haberlo visto y luego dice que no estaba allí.'
+        })
+    },
+    {
+        role: 'user',
+        content: buildInsightsPrompt({
+            caseName: EXAMPLE_CASE,
+            history: '',
+            reported: [],
+            newText: 'Le entregué un millón doscientos mil pesos en efectivo el quince de marzo en la oficina, sin recibo.'
+        })
+    },
+    {
+        role: 'assistant',
+        content: JSON.stringify({
+            k: 'dato',
+            titulo: 'Pago en efectivo',
+            detalle: '$1.200.000 entregados el 15 de marzo en la oficina, sin recibo.'
+        })
+    },
+    {
+        role: 'user',
+        content: buildInsightsPrompt({
+            caseName: EXAMPLE_CASE,
+            history: '',
+            reported: [],
+            newText: 'Sí, señoría, muchas gracias, entendido.'
+        })
+    },
+    { role: 'assistant', content: LLM_CONFIG.nothingToken }
 ];
 
 // =================== Utilidades del LLM ===================
 
-/**
- * Normaliza un texto a un conjunto de palabras relevantes (sin tildes ni signos).
- */
-const toWordSet = (text) =>
-    new Set(
-        text
-            .toLowerCase()
-            .normalize('NFD')
-            .replace(/[\u0300-\u036f]/g, '')
-            .replace(/[^a-z0-9\s]/g, ' ')
-            .split(/\s+/)
-            .filter((word) => word.length > 3)
-    );
+/** Texto en minúsculas, sin tildes ni signos (para comparar). */
+const canon = (text = '') =>
+    String(text)
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
 
-/**
- * Indica si una pregunta es casi idéntica a alguna ya sugerida.
- */
-const isDuplicateQuestion = (question, history) => {
-    const candidate = toWordSet(question);
-    if (!candidate.size) return false;
+/** Identificador en solo letras (para interpretar etiquetas que escribe el modelo). */
+const normalizeKey = (value = '') => canon(value).replace(/[^a-z]/g, '');
 
-    return history.some((previous) => {
-        const other = toWordSet(previous);
-        const intersection = [...candidate].filter((word) => other.has(word)).length;
-        const union = new Set([...candidate, ...other]).size;
-        return union > 0 && intersection / union >= LLM_CONFIG.similarityThreshold;
-    });
+/** Recorta un texto a un máximo de caracteres, en una sola línea. */
+const clip = (value, max) => {
+    const text = String(value || '').replace(/\s+/g, ' ').trim();
+    return text.length > max ? `${text.slice(0, max - 1).trim()}…` : text;
 };
 
+/** Conjunto de palabras relevantes de un texto. */
+const toWordSet = (text) => new Set(canon(text).split(' ').filter((word) => word.length > 3));
+
+/** Similitud de Jaccard entre dos textos (0 a 1). */
+const similarity = (a, b) => {
+    const first = toWordSet(a);
+    const second = toWordSet(b);
+    if (!first.size || !second.size) return 0;
+
+    const intersection = [...first].filter((word) => second.has(word)).length;
+    const union = new Set([...first, ...second]).size;
+    return union > 0 ? intersection / union : 0;
+};
+
+/** Indica si un texto es casi idéntico a alguno del historial. */
+const isDuplicateQuestion = (question, history, threshold = LLM_CONFIG.similarityThreshold) =>
+    history.some((previous) => similarity(question, previous) >= threshold);
+
 /**
- * Limpia la salida del modelo y devuelve una pregunta válida o null.
+ * Limpia un texto generado por el modelo y devuelve una pregunta válida o null.
  */
 const cleanQuestion = (raw = '') => {
+    const cfg = LLM_CONFIG.questions;
+
     let text = String(raw)
         .replace(/<think>[\s\S]*?<\/think>/gi, '')
         .replace(/```/g, '')
@@ -213,141 +445,506 @@ const cleanQuestion = (raw = '') => {
     if (!text.startsWith('¿')) text = `¿${text}`;
 
     const words = text.split(/\s+/).length;
-    if (
-        words < LLM_CONFIG.minQuestionWords ||
-        words > LLM_CONFIG.maxQuestionWords ||
-        text.length > LLM_CONFIG.maxQuestionChars
-    ) {
-        return null;
-    }
+    if (words < cfg.minWords || words > cfg.maxWords || text.length > cfg.maxChars) return null;
 
     return text;
 };
 
-/**
- * Llama a Ollama con un tiempo límite y devuelve el texto generado.
- */
-const requestFromLLM = async (messages) => {
-    let timer;
-
-    const call = ollama.chat({
-        model: LLM_CONFIG.model,
-        messages,
-        stream: false,
-        think: false,       // Sin "razonamiento": respuesta directa y mucho más rápida
-        keep_alive: '30m',  // Mantiene el modelo cargado en memoria
-        options: {
-            temperature: 0.3,
-            top_p: 0.9,
-            repeat_penalty: 1.1,
-            num_ctx: 4096,
-            num_predict: 120
-        }
-    });
-
-    // Evita un "unhandled rejection" si el timeout gana la carrera.
-    call.catch(() => { });
-
-    const timeout = new Promise((_, reject) => {
-        timer = setTimeout(
-            () => reject(new Error('Tiempo de espera agotado en Ollama')),
-            LLM_CONFIG.timeoutMs
-        );
-    });
-
-    try {
-        const result = await Promise.race([call, timeout]);
-        return result?.message?.content || '';
-    } finally {
-        clearTimeout(timer);
+// -- Objeciones: texto que se muestra y frase lista para decir en la audiencia --
+const OBJECTION_TYPES = {
+    capciosa: {
+        label: 'Pregunta capciosa',
+        say: 'Objeción, señoría: la pregunta es capciosa, induce al testigo a error.',
+        note: null
+    },
+    sugestiva: {
+        label: 'Pregunta sugestiva',
+        say: 'Objeción, señoría: la pregunta es sugestiva, insinúa la respuesta.',
+        note: 'Procede en el interrogatorio directo; en el contrainterrogatorio está permitida.'
+    },
+    impertinente: {
+        label: 'Pregunta impertinente o irrelevante',
+        say: 'Objeción, señoría: la pregunta es impertinente, no guarda relación con los hechos del debate.',
+        note: null
+    },
+    ambigua: {
+        label: 'Pregunta ambigua, confusa o vaga',
+        say: 'Objeción, señoría: la pregunta es ambigua y confusa; solicito que se formule con claridad.',
+        note: null
+    },
+    compuesta: {
+        label: 'Pregunta compuesta',
+        say: 'Objeción, señoría: la pregunta es compuesta; solicito que se formule una a la vez.',
+        note: null
+    },
+    repetitiva: {
+        label: 'Pregunta repetitiva',
+        say: 'Objeción, señoría: la pregunta es repetitiva, ya fue respondida por el testigo.',
+        note: null
+    },
+    especulativa: {
+        label: 'Pregunta especulativa',
+        say: 'Objeción, señoría: la pregunta es especulativa, pide al testigo suponer sobre hechos que no le constan.',
+        note: null
     }
 };
 
-// =================== Motor de preguntas en vivo ===================
+const QUESTION_CATEGORIES = ['aclarar', 'precisar', 'verificar', 'cuestionar', 'profundizar'];
+
+/** Convierte lo que devolvió el modelo en una pregunta con versiones alternativas. */
+const parseQuestion = (obj, askedAll) => {
+    const main = cleanQuestion(obj?.q);
+    if (!main) return { status: 'invalid' };
+    if (isDuplicateQuestion(main, askedAll)) return { status: 'duplicate' };
+
+    const variants = [];
+    const taken = [main];
+
+    [['Más directa', obj.directa], ['Más abierta', obj.abierta]].forEach(([label, raw]) => {
+        const text = cleanQuestion(raw);
+        if (!text || isDuplicateQuestion(text, taken, 0.8)) return;
+
+        taken.push(text);
+        variants.push({ label, text });
+    });
+
+    const key = normalizeKey(obj.enfoque);
+
+    return {
+        status: 'ok',
+        data: {
+            question: main,
+            variants,
+            category: QUESTION_CATEGORIES.find((category) => key.includes(category)) || null,
+            reason: clip(obj.porque, 160) || null
+        }
+    };
+};
+
+/** Convierte lo que devolvió el modelo en una objeción. */
+const parseObjection = (obj) => {
+    const key = normalizeKey(obj?.t);
+    const type = Object.keys(OBJECTION_TYPES).find((name) => key === name || key.includes(name));
+    if (!type) return null;
+
+    const quote = clip(obj.cita, 240);
+    if (quote.length < 8) return null;
+
+    const config = OBJECTION_TYPES[type];
+
+    return {
+        kind: 'objection',
+        subtype: type,
+        title: config.label,
+        quote,
+        quote_prev: null,
+        detail: clip(obj.motivo, 180) || null,
+        say: config.say,
+        note: config.note,
+        compareText: quote
+    };
+};
+
+/** Convierte lo que devolvió el modelo en una contradicción o en un dato clave. */
+const parseInsight = (obj) => {
+    const key = normalizeKey(obj?.k);
+
+    if (key.includes('contradic')) {
+        const before = clip(obj.antes, 240);
+        const now = clip(obj.ahora, 240);
+        if (before.length < 5 || now.length < 5) return null;
+
+        return {
+            kind: 'contradiction',
+            subtype: 'contradiccion',
+            title: clip(obj.titulo, 80) || 'Posible contradicción',
+            quote: now,
+            quote_prev: before,
+            detail: clip(obj.detalle, 200) || null,
+            say: null,
+            note: null,
+            compareText: `${before} ${now}`
+        };
+    }
+
+    if (key.includes('dato')) {
+        const detail = clip(obj.detalle, 220);
+        if (detail.length < 5) return null;
+
+        return {
+            kind: 'key_data',
+            subtype: 'dato',
+            title: clip(obj.titulo, 60) || 'Dato importante',
+            quote: null,
+            quote_prev: null,
+            detail,
+            say: null,
+            note: null,
+            compareText: detail
+        };
+    }
+
+    return null;
+};
+
+/** Indica si un hallazgo ya fue reportado (mismo tipo y texto muy parecido). */
+const isDuplicateAlert = (alert, history) =>
+    history.some(
+        (previous) =>
+            previous.kind === alert.kind &&
+            previous.subtype === alert.subtype &&
+            similarity(previous.compareText, alert.compareText) >= 0.6
+    );
+
 /**
- * Un motor por conexión. Recibe la transcripción final fragmento a fragmento,
- * acumula contexto y, cada vez que hay texto nuevo suficiente, le pide al LLM
- * UNA pregunta. Si el modelo considera que aún falta contexto, el texto sigue
- * acumulándose para la siguiente evaluación.
+ * Llama a Ollama en streaming. Cada objeto JSON completo que aparezca en la
+ * respuesta se entrega a onObject apenas se genera (sin esperar al final).
+ * Devuelve el texto completo generado.
+ */
+const streamFromLLM = async ({ model = LLM_CONFIG.model, messages, numPredict, temperature = 0.2 }, onObject) => {
+    let stream = null;
+    let timer;
+    let timedOut = false;
+
+    const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+            timedOut = true;
+            if (stream?.abort) stream.abort();
+            reject(new Error('Tiempo de espera agotado en Ollama'));
+        }, LLM_CONFIG.timeoutMs);
+    });
+    timeout.catch(() => { }); // Evita un "unhandled rejection" si nadie la está esperando.
+
+    const call = ollama.chat({
+        model,
+        messages,
+        stream: true,
+        think: false,       // Sin "razonamiento": respuesta directa y mucho más rápida
+        keep_alive: LLM_CONFIG.keepAlive,
+        options: {
+            temperature,
+            top_p: 0.9,
+            repeat_penalty: 1.1,
+            num_ctx: LLM_CONFIG.numCtx,
+            num_predict: numPredict
+        }
+    });
+    call.catch(() => { });
+
+    let full = '';
+    let buffer = '';
+
+    try {
+        stream = await Promise.race([call, timeout]);
+
+        for await (const part of stream) {
+            const chunk = part?.message?.content || '';
+            if (!chunk) continue;
+
+            full += chunk;
+            buffer += chunk;
+
+            // Extrae los objetos JSON planos completos que haya en el búfer.
+            let match;
+            while ((match = /\{[^{}]*\}/.exec(buffer))) {
+                buffer = buffer.slice(match.index + match[0].length);
+
+                let parsed = null;
+                try {
+                    parsed = JSON.parse(match[0]);
+                } catch {
+                    // Objeto mal formado: se ignora.
+                }
+
+                if (parsed && onObject) await onObject(parsed);
+            }
+        }
+    } catch (error) {
+        if (timedOut) throw new Error('Tiempo de espera agotado en Ollama');
+        throw error;
+    } finally {
+        clearTimeout(timer);
+    }
+
+    return full.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+};
+
+// =================== Motor del asistente en vivo ===================
+/**
+ * Un motor por conexión. Recibe la transcripción (parcial y final) y, en tres
+ * carriles paralelos, genera: objeciones, contradicciones / datos clave y
+ * preguntas sugeridas con versiones alternativas.
  *
  * @param {object}   options
+ * @param {string}   options.tipo            penal | civil | laboral | administrativo
  * @param {string}   options.caseName        Nombre del caso.
  * @param {string}   options.caseDescription Descripción del caso.
  * @param {Function} options.onStatus        Callback ({ state, message }).
  * @param {Function} options.onQuestion      Callback async (question) que persiste y emite.
+ * @param {Function} options.onAlert         Callback async (alert) que persiste y emite.
  */
-const createQuestionEngine = ({ caseName, caseDescription, onStatus, onQuestion }) => {
-    let pendingSegments = [];   // Texto aún no "consumido" por una pregunta
-    let recentContext = '';     // Cola de lo ya consumido, solo como referencia
-    let charsSinceEvaluation = 0;
-    let isProcessing = false;
+const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQuestion, onAlert }) => {
+    const prompts = buildSystemPrompts(tipo);
+
+    const segments = [];          // Todas las intervenciones finales, en orden
+    const askedMain = [];         // Preguntas principales ya sugeridas (se le recuerdan al modelo)
+    const askedAll = [];          // Principales + variantes (para evitar repetidos)
+    const reportedAlerts = [];    // Objeciones y hallazgos ya emitidos
+
     let isActive = true;
 
-    const askedQuestions = [];
+    // -- Preguntas --
+    let questionCursor = 0;       // Índice de la primera intervención aún no "consumida"
+    let questionChars = 0;        // Texto nuevo desde la última evaluación
+    let questionOutcome = 'idle'; // idle | ready | no_context
 
-    const evaluate = async () => {
-        if (!isActive || isProcessing) return;
-        if (charsSinceEvaluation < LLM_CONFIG.minNewChars) return;
+    // -- Contradicciones y datos --
+    let insightCursor = 0;
+    let insightChars = 0;
 
-        isProcessing = true;
-        charsSinceEvaluation = 0;
+    // -- Objeciones --
+    let lastObjectionText = '';
 
-        // Instantánea: el texto que llegue durante el análisis no se pierde.
-        const snapshotCount = pendingSegments.length;
-        const newText = pendingSegments.join(' ').slice(-LLM_CONFIG.maxPromptChars);
+    // -- Estado que se le muestra al abogado --
+    let heavyInFlight = 0;
+    let hasError = false;
+    let lastStatusKey = '';
 
-        onStatus({ state: 'thinking', message: 'Analizando lo último que se dijo...' });
+    const publishStatus = () => {
+        if (!isActive) return;
 
-        try {
-            const raw = await requestFromLLM([
-                { role: 'system', content: SYSTEM_PROMPT },
-                ...FEW_SHOT_MESSAGES,
-                {
-                    role: 'user',
-                    content: buildUserPrompt({
-                        caseName,
-                        caseDescription,
-                        recentContext,
-                        askedQuestions: askedQuestions.slice(-LLM_CONFIG.maxQuestionHistory),
-                        newText
-                    })
-                }
-            ]);
+        let status;
+        if (heavyInFlight > 0) {
+            status = { state: 'thinking', message: 'Analizando lo último que se dijo...' };
+        } else if (hasError) {
+            status = { state: 'error', message: 'El modelo local no respondió. Verifica que Ollama esté en ejecución.' };
+        } else if (questionOutcome === 'no_context') {
+            status = { state: 'no_context', message: 'Aún no hay contexto suficiente para sugerir preguntas.' };
+        } else {
+            status = { state: 'listening', message: 'Escuchando la audiencia...' };
+        }
 
-            const question = cleanQuestion(raw);
+        const key = `${status.state}|${status.message}`;
+        if (key === lastStatusKey) return;
 
+        lastStatusKey = key;
+        onStatus(status);
+    };
+
+    /**
+     * Un carril ejecuta una tarea a la vez. Si llega otra solicitud mientras corre,
+     * se guarda solo la más reciente y se atiende al terminar.
+     */
+    const createLane = ({ name, heavy, canRun, execute }) => {
+        let running = false;
+        let queued = null;
+
+        const run = async (payload) => {
             if (!isActive) return;
 
-            if (!question || isDuplicateQuestion(question, askedQuestions)) {
-                console.log('[IA] Sin pregunta útil. Respuesta cruda:', JSON.stringify(raw));
-                onStatus({ state: 'listening', message: 'Escuchando. Aún falta contexto para la siguiente pregunta.' });
+            if (running) {
+                queued = { payload };
                 return;
             }
 
-            await onQuestion(question);
+            if (canRun && !canRun(payload)) return;
 
-            askedQuestions.push(question);
-            recentContext = `${recentContext} ${newText}`.trim().slice(-LLM_CONFIG.recentContextChars);
-            pendingSegments = pendingSegments.slice(snapshotCount);
+            running = true;
+            if (heavy) {
+                heavyInFlight += 1;
+                publishStatus();
+            }
 
-            console.log(`[IA] Pregunta generada: ${question}`);
-            onStatus({ state: 'listening', message: 'Escuchando la audiencia...' });
+            try {
+                await execute(payload);
+                hasError = false;
+            } catch (error) {
+                console.error(`[IA:${name}] Error:`, error.message || error);
+                hasError = true;
+            } finally {
+                running = false;
+                if (heavy) heavyInFlight -= 1;
+                publishStatus();
 
-        } catch (error) {
-            console.error('[IA] Error generando pregunta:', error.message || error);
-            onStatus({
-                state: 'error',
-                message: 'El modelo local no respondió. Verifica que Ollama esté en ejecución.'
-            });
-        } finally {
-            isProcessing = false;
+                if (isActive && queued) {
+                    const next = queued;
+                    queued = null;
+                    void run(next.payload);
+                }
+            }
+        };
 
-            // Si mientras se analizaba llegó suficiente texto nuevo, evaluar de nuevo.
-            if (isActive && charsSinceEvaluation >= LLM_CONFIG.minNewChars) {
-                void evaluate();
+        return run;
+    };
+
+    // ---------- Carril 1: objeciones ----------
+    const runObjections = createLane({
+        name: 'objeciones',
+        heavy: false,
+        execute: async ({ text, contextEnd }) => {
+            const cfg = LLM_CONFIG.objections;
+
+            const lastTurn = text.slice(-cfg.maxTextChars);
+            const recentContext = segments.slice(0, contextEnd).join(' ').slice(-cfg.recentContextChars);
+
+            let count = 0;
+
+            await streamFromLLM(
+                {
+                    model: LLM_CONFIG.fastModel,
+                    numPredict: cfg.numPredict,
+                    temperature: cfg.temperature,
+                    messages: [
+                        { role: 'system', content: prompts.objections },
+                        ...OBJECTIONS_FEW_SHOT,
+                        {
+                            role: 'user',
+                            content: buildObjectionsPrompt({ caseName, caseDescription, recentContext, lastTurn })
+                        }
+                    ]
+                },
+                async (obj) => {
+                    if (!isActive || count >= cfg.maxPerTurn) return;
+
+                    const alert = parseObjection(obj);
+                    if (!alert || isDuplicateAlert(alert, reportedAlerts)) return;
+
+                    reportedAlerts.push(alert);
+                    count += 1;
+
+                    await onAlert(alert);
+                    console.log(`[IA] Objeción (${alert.subtype}): ${alert.quote}`);
+                }
+            );
+        }
+    });
+
+    // ---------- Carril 2: contradicciones y datos clave ----------
+    const runInsights = createLane({
+        name: 'hallazgos',
+        heavy: true,
+        canRun: () => insightChars >= LLM_CONFIG.insights.minNewChars,
+        execute: async () => {
+            const cfg = LLM_CONFIG.insights;
+
+            insightChars = 0;
+
+            const snapshot = segments.length;
+            const newText = segments.slice(insightCursor, snapshot).join(' ').slice(-cfg.maxNewChars);
+            const history = segments.slice(0, insightCursor).join(' ').slice(-cfg.historyChars);
+            const reported = reportedAlerts
+                .filter((alert) => alert.kind !== 'objection')
+                .slice(-cfg.maxReported)
+                .map((alert) => `${alert.title}: ${alert.detail || alert.quote}`);
+
+            let count = 0;
+
+            await streamFromLLM(
+                {
+                    numPredict: cfg.numPredict,
+                    temperature: cfg.temperature,
+                    messages: [
+                        { role: 'system', content: prompts.insights },
+                        ...INSIGHTS_FEW_SHOT,
+                        {
+                            role: 'user',
+                            content: buildInsightsPrompt({ caseName, caseDescription, history, reported, newText })
+                        }
+                    ]
+                },
+                async (obj) => {
+                    if (!isActive || count >= cfg.maxPerTurn) return;
+
+                    const alert = parseInsight(obj);
+                    if (!alert || isDuplicateAlert(alert, reportedAlerts)) return;
+
+                    reportedAlerts.push(alert);
+                    count += 1;
+
+                    await onAlert(alert);
+                    console.log(`[IA] Hallazgo (${alert.subtype}): ${alert.title}`);
+                }
+            );
+
+            // Lo ya revisado pasa al historial, haya o no hallazgos.
+            if (isActive) insightCursor = snapshot;
+        }
+    });
+
+    // ---------- Carril 3: preguntas sugeridas ----------
+    const runQuestions = createLane({
+        name: 'preguntas',
+        heavy: true,
+        canRun: () => questionChars >= LLM_CONFIG.questions.minNewChars,
+        execute: async () => {
+            const cfg = LLM_CONFIG.questions;
+
+            questionChars = 0;
+
+            // Instantánea: el texto que llegue durante el análisis no se pierde.
+            const snapshot = segments.length;
+            const newText = segments.slice(questionCursor, snapshot).join(' ').slice(-cfg.maxNewChars);
+            const recentContext = segments.slice(0, questionCursor).join(' ').slice(-cfg.recentContextChars);
+
+            let emitted = false;
+            let sawDuplicate = false;
+
+            const raw = await streamFromLLM(
+                {
+                    numPredict: cfg.numPredict,
+                    temperature: cfg.temperature,
+                    messages: [
+                        { role: 'system', content: prompts.questions },
+                        ...QUESTIONS_FEW_SHOT,
+                        {
+                            role: 'user',
+                            content: buildQuestionsPrompt({
+                                caseName,
+                                caseDescription,
+                                recentContext,
+                                askedQuestions: askedMain.slice(-cfg.maxHistory),
+                                newText
+                            })
+                        }
+                    ]
+                },
+                async (obj) => {
+                    if (!isActive || emitted) return;
+
+                    const result = parseQuestion(obj, askedAll);
+
+                    if (result.status === 'duplicate') {
+                        sawDuplicate = true;
+                        return;
+                    }
+
+                    if (result.status !== 'ok') return;
+
+                    emitted = true;
+                    askedMain.push(result.data.question);
+                    askedAll.push(result.data.question, ...result.data.variants.map((variant) => variant.text));
+
+                    await onQuestion(result.data);
+                    console.log(`[IA] Pregunta generada: ${result.data.question}`);
+                }
+            );
+
+            if (!isActive) return;
+
+            if (emitted) {
+                questionOutcome = 'ready';
+                questionCursor = snapshot;
+            } else if (sawDuplicate) {
+                // Había algo para preguntar, pero ya se había sugerido.
+                questionOutcome = 'idle';
+                questionCursor = snapshot;
+            } else {
+                // El texto se sigue acumulando para la siguiente evaluación.
+                questionOutcome = 'no_context';
+                console.log('[IA] Sin pregunta útil. Respuesta cruda:', JSON.stringify(raw));
             }
         }
-    };
+    });
 
     return {
         /** Agrega una intervención final de la transcripción. */
@@ -357,20 +954,37 @@ const createQuestionEngine = ({ caseName, caseDescription, onStatus, onQuestion 
             const clean = String(text || '').trim();
             if (!clean) return;
 
-            pendingSegments.push(clean);
-            charsSinceEvaluation += clean.length;
+            segments.push(clean);
+            questionChars += clean.length;
+            insightChars += clean.length;
 
-            // Evita que el buffer crezca sin límite si el modelo no encuentra contexto.
-            if (!isProcessing) {
-                while (
-                    pendingSegments.length > 1 &&
-                    pendingSegments.join(' ').length > LLM_CONFIG.maxPromptChars * 2
-                ) {
-                    pendingSegments.shift();
-                }
+            // Objeciones: se evalúan siempre, salvo que ya se hayan evaluado con este mismo texto.
+            const objectionCfg = LLM_CONFIG.objections;
+
+            if (clean.length >= objectionCfg.minChars && canon(clean) !== canon(lastObjectionText)) {
+                lastObjectionText = clean;
+                void runObjections({ text: clean, contextEnd: segments.length - 1 });
             }
 
-            void evaluate();
+            void runInsights();
+            void runQuestions();
+        },
+
+        /**
+         * Recibe texto parcial (el turno aún no termina). Si ya suena a pregunta completa,
+         * se evalúa de inmediato para mostrar la objeción lo antes posible.
+         */
+        addInterim(text) {
+            if (!isActive) return;
+
+            const clean = String(text || '').trim();
+            const cfg = LLM_CONFIG.objections;
+
+            if (clean.length < cfg.earlyMinChars || !/[?？]\s*$/.test(clean)) return;
+            if (canon(clean) === canon(lastObjectionText)) return;
+
+            lastObjectionText = clean;
+            void runObjections({ text: clean, contextEnd: segments.length });
         },
 
         /** Detiene el motor (fin de sesión o desconexión). */
@@ -617,6 +1231,44 @@ const initializeDatabase = async () => {
         ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id) ON DELETE SET NULL
     `);
 
+    // -- Tipo de audiencia (penal, civil, laboral o administrativo). Las audiencias anteriores quedan como "penal" --
+    await pool.query(`
+        ALTER TABLE sessions
+        ADD COLUMN IF NOT EXISTS tipo VARCHAR(20) NOT NULL DEFAULT 'penal'
+        CHECK (tipo IN ('penal', 'civil', 'laboral', 'administrativo'))
+    `);
+
+    // -- Preguntas: versiones alternativas, enfoque y motivo --
+    await pool.query(`ALTER TABLE ai_questions ADD COLUMN IF NOT EXISTS variants JSONB NOT NULL DEFAULT '[]'::jsonb`);
+    await pool.query(`ALTER TABLE ai_questions ADD COLUMN IF NOT EXISTS category VARCHAR(30)`);
+    await pool.query(`ALTER TABLE ai_questions ADD COLUMN IF NOT EXISTS reason TEXT`);
+
+    // -- Alertas del asistente: objeciones, contradicciones y datos clave --
+    // El tipo de session_id se toma de sessions.id para que la llave foránea siempre sea compatible.
+    const sessionIdTypeResult = await pool.query(
+        `SELECT format_type(atttypid, atttypmod) AS type
+         FROM pg_attribute
+         WHERE attrelid = 'sessions'::regclass AND attname = 'id'`
+    );
+    const sessionIdType = sessionIdTypeResult.rows[0]?.type || 'integer';
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS ai_alerts (
+            id         SERIAL PRIMARY KEY,
+            session_id ${sessionIdType} NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            kind       VARCHAR(20)  NOT NULL CHECK (kind IN ('objection', 'contradiction', 'key_data')),
+            subtype    VARCHAR(30),
+            title      TEXT         NOT NULL,
+            quote      TEXT,
+            quote_prev TEXT,
+            detail     TEXT,
+            say        TEXT,
+            note       TEXT,
+            created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+        )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS ai_alerts_session_idx ON ai_alerts (session_id, created_at)`);
+
     // -- Administrador inicial --
     const existingAdmin = await pool.query(`SELECT 1 FROM users WHERE rol = 'admin' LIMIT 1`);
 
@@ -859,7 +1511,7 @@ app.get('/api/sessions', authenticate, async (req, res) => {
         );
 
         const result = await pool.query(
-            `SELECT s.id, s.case_name, s.case_description, s.status, s.created_at,
+            `SELECT s.id, s.case_name, s.case_description, s.tipo, s.status, s.created_at,
                     u.nombre AS owner_name
              FROM sessions s
              LEFT JOIN users u ON u.id = s.user_id
@@ -885,14 +1537,20 @@ app.get('/api/sessions', authenticate, async (req, res) => {
 app.post('/api/sessions', authenticate, requireActiveSubscription, async (req, res) => {
     try {
         const { case_name, case_description } = req.body;
+        const tipo = String(req.body?.tipo || '').trim().toLowerCase();
+
+        if (!AUDIENCE_TYPES.includes(tipo)) {
+            throw new AppError('Selecciona el tipo de audiencia: penal, civil, laboral o administrativo.');
+        }
 
         const result = await pool.query(
-            `INSERT INTO sessions (case_name, case_description, user_id)
-             VALUES ($1, $2, $3)
-             RETURNING id, case_name, case_description, status, created_at`,
+            `INSERT INTO sessions (case_name, case_description, tipo, user_id)
+             VALUES ($1, $2, $3, $4)
+             RETURNING id, case_name, case_description, tipo, status, created_at`,
             [
                 String(case_name || '').trim().slice(0, 200) || 'Audiencia sin título',
                 String(case_description || '').trim().slice(0, 2000),
+                tipo,
                 req.user.id
             ]
         );
@@ -913,7 +1571,7 @@ app.get('/api/sessions/:id', authenticate, async (req, res) => {
         const { id } = req.params;
 
         const sessionResult = await pool.query(
-            `SELECT s.id, s.case_name, s.case_description, s.status, s.created_at, s.user_id,
+            `SELECT s.id, s.case_name, s.case_description, s.tipo, s.status, s.created_at, s.user_id,
                     u.nombre AS owner_name
              FROM sessions s
              LEFT JOIN users u ON u.id = s.user_id
@@ -937,8 +1595,16 @@ app.get('/api/sessions/:id', authenticate, async (req, res) => {
         );
 
         const questionsResult = await pool.query(
-            `SELECT id, question, created_at
+            `SELECT id, question, variants, category, reason, created_at
              FROM ai_questions
+             WHERE session_id = $1
+             ORDER BY created_at ASC, id ASC`,
+            [id]
+        );
+
+        const alertsResult = await pool.query(
+            `SELECT id, kind, subtype, title, quote, quote_prev, detail, say, note, created_at
+             FROM ai_alerts
              WHERE session_id = $1
              ORDER BY created_at ASC, id ASC`,
             [id]
@@ -948,9 +1614,11 @@ app.get('/api/sessions/:id', authenticate, async (req, res) => {
             session,
             transcriptions: transcriptionResult.rows,
             ai_questions: questionsResult.rows,
+            ai_alerts: alertsResult.rows,
             statistics: {
                 total_transcriptions: transcriptionResult.rows.length,
-                total_questions: questionsResult.rows.length
+                total_questions: questionsResult.rows.length,
+                total_alerts: alertsResult.rows.length
             }
         });
 
@@ -964,9 +1632,11 @@ app.get('/api/llm/health', authenticate, requireAdmin, async (req, res) => {
     const start = Date.now();
 
     try {
-        const response = await requestFromLLM([
-            { role: 'user', content: 'Responde únicamente con la palabra: ok' }
-        ]);
+        const response = await streamFromLLM({
+            messages: [{ role: 'user', content: 'Responde únicamente con la palabra: ok' }],
+            numPredict: 10,
+            temperature: 0
+        });
 
         res.json({
             success: true,
@@ -1015,7 +1685,7 @@ io.on('connection', (socket) => {
     let currentSessionId = null;
     let isConnecting = false;
     let isStopping = false;
-    let questionEngine = null;
+    let assistantEngine = null;
     let transcriptionQueue = Promise.resolve();
 
     /**
@@ -1039,26 +1709,50 @@ io.on('connection', (socket) => {
     };
 
     /**
-     * Guarda una pregunta generada y la envía a todos los clientes de la sesión.
+     * Guarda una pregunta generada (con sus versiones) y la envía a todos los clientes de la sesión.
      */
-    const saveAndEmitQuestion = async (question) => {
+    const saveAndEmitQuestion = async ({ question, variants, category, reason }) => {
         const result = await pool.query(
-            `INSERT INTO ai_questions (session_id, question)
-             VALUES ($1, $2)
-             RETURNING id, question, created_at`,
-            [currentSessionId, question]
+            `INSERT INTO ai_questions (session_id, question, variants, category, reason)
+             VALUES ($1, $2, $3::jsonb, $4, $5)
+             RETURNING id, question, variants, category, reason, created_at`,
+            [currentSessionId, question, JSON.stringify(variants || []), category, reason]
         );
 
         io.to(currentSessionId).emit('new_question', result.rows[0]);
     };
 
     /**
-     * Detiene el motor de preguntas.
+     * Guarda una objeción, contradicción o dato clave y lo envía a todos los clientes de la sesión.
+     */
+    const saveAndEmitAlert = async (alert) => {
+        const result = await pool.query(
+            `INSERT INTO ai_alerts (session_id, kind, subtype, title, quote, quote_prev, detail, say, note)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             RETURNING id, kind, subtype, title, quote, quote_prev, detail, say, note, created_at`,
+            [
+                currentSessionId,
+                alert.kind,
+                alert.subtype,
+                alert.title,
+                alert.quote,
+                alert.quote_prev,
+                alert.detail,
+                alert.say,
+                alert.note
+            ]
+        );
+
+        io.to(currentSessionId).emit('new_alert', result.rows[0]);
+    };
+
+    /**
+     * Detiene el motor del asistente.
      */
     const releaseResources = () => {
-        if (questionEngine) {
-            questionEngine.stop();
-            questionEngine = null;
+        if (assistantEngine) {
+            assistantEngine.stop();
+            assistantEngine = null;
         }
     };
 
@@ -1082,7 +1776,7 @@ io.on('connection', (socket) => {
 
             // 2. Verificar que la audiencia exista y pertenezca al usuario.
             const caseResult = await pool.query(
-                'SELECT case_name, case_description, user_id FROM sessions WHERE id = $1',
+                'SELECT case_name, case_description, tipo, user_id FROM sessions WHERE id = $1',
                 [sessionId]
             );
             const caseInfo = caseResult.rows[0];
@@ -1095,12 +1789,14 @@ io.on('connection', (socket) => {
             socket.join(currentSessionId);
             console.log(`[BACKEND] Transmitiendo audio para la sesión: ${currentSessionId}`);
 
-            // 3. Motor de preguntas con el contexto del caso.
-            questionEngine = createQuestionEngine({
+            // 3. Motor del asistente con el contexto del caso y el prompt según el tipo de audiencia.
+            assistantEngine = createAssistantEngine({
+                tipo: caseInfo.tipo,
                 caseName: caseInfo.case_name,
                 caseDescription: caseInfo.case_description,
                 onStatus: (status) => socket.emit('ai_status', status),
-                onQuestion: saveAndEmitQuestion
+                onQuestion: saveAndEmitQuestion,
+                onAlert: saveAndEmitAlert
             });
 
             // 4. Deepgram SDK v5 - Flux
@@ -1136,10 +1832,13 @@ io.on('connection', (socket) => {
                     isFinal
                 });
 
-                // Solo las intervenciones definitivas se guardan y alimentan al LLM.
+                // Las intervenciones definitivas se guardan y alimentan al asistente.
+                // El texto parcial solo sirve para detectar objeciones lo antes posible.
                 if (isFinal) {
                     saveTranscription(transcript);
-                    questionEngine?.addTranscript(transcript);
+                    assistantEngine?.addTranscript(transcript);
+                } else {
+                    assistantEngine?.addInterim(transcript);
                 }
             });
 
@@ -1163,7 +1862,7 @@ io.on('connection', (socket) => {
             deepgramLive.connect();
             await deepgramLive.waitForOpen();
 
-            console.log(`[IA] Motor de preguntas activo. Modelo: ${LLM_CONFIG.model}`);
+            console.log(`[IA] Asistente activo (${caseInfo.tipo}). Modelo: ${LLM_CONFIG.model}`);
 
         } catch (error) {
             console.error('[BACKEND] Error iniciando la sesión:', error.message || error);

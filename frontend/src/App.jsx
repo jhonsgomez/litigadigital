@@ -13,7 +13,60 @@ const DEFAULT_SUBSCRIPTION_DAYS = 30;
 const TYPING_SPEED_MS = 28;
 
 const BLUE = '#0A57A7';
-const INITIAL_FORM = { case_name: '', case_description: '', audioSource: 'mic' };
+const INITIAL_FORM = { case_name: '', case_description: '', tipo: '', audioSource: 'mic' };
+
+// -- Tipos de audiencia: el valor se guarda en la BD y define el prompt que usa el asistente --
+const AUDIENCE_TYPES = [
+  { value: 'penal', label: 'Penal', hint: 'Delitos, fiscalía y defensa' },
+  { value: 'civil', label: 'Civil', hint: 'Contratos, deudas y responsabilidad' },
+  { value: 'laboral', label: 'Laboral', hint: 'Relaciones y conflictos de trabajo' },
+  { value: 'administrativo', label: 'Administrativo', hint: 'Actos y entidades del Estado' }
+];
+
+const AUDIENCE_TYPE_LABEL = Object.fromEntries(AUDIENCE_TYPES.map((type) => [type.value, type.label]));
+
+// -- Cada tipo de sugerencia del asistente tiene su propio color y etiqueta --
+const FEED_KINDS = {
+  objection: {
+    label: 'Objeción',
+    card: 'border-l-rose-500 bg-rose-50/50',
+    chip: 'bg-rose-100 text-rose-800',
+    ring: 'ring-rose-300'
+  },
+  question: {
+    label: 'Pregunta',
+    card: 'border-l-emerald-500 bg-white',
+    chip: 'bg-emerald-100 text-emerald-800',
+    ring: 'ring-emerald-300'
+  },
+  contradiction: {
+    label: 'Contradicción',
+    card: 'border-l-amber-500 bg-white',
+    chip: 'bg-amber-100 text-amber-800',
+    ring: 'ring-amber-300'
+  },
+  key_data: {
+    label: 'Dato clave',
+    card: 'border-l-sky-500 bg-white',
+    chip: 'bg-sky-100 text-sky-800',
+    ring: 'ring-sky-300'
+  }
+};
+
+const FEED_FILTERS = [
+  { id: 'all', label: 'Todo', match: () => true },
+  { id: 'objection', label: 'Objeciones', match: (item) => item.kind === 'objection' },
+  { id: 'question', label: 'Preguntas', match: (item) => item.kind === 'question' },
+  { id: 'alert', label: 'Alertas', match: (item) => item.kind === 'contradiction' || item.kind === 'key_data' }
+];
+
+const QUESTION_CATEGORY_LABEL = {
+  aclarar: 'Aclarar',
+  precisar: 'Precisar',
+  verificar: 'Verificar',
+  cuestionar: 'Cuestionar',
+  profundizar: 'Profundizar'
+};
 const INITIAL_AI_STATUS = { state: 'idle', message: 'Esperando el inicio de la audiencia' };
 
 // -- Casos de ejemplo que se simulan en la portada --
@@ -64,6 +117,7 @@ const NAV_LINK =
 const STATUS_DOT = {
   idle: 'bg-gray-300',
   listening: 'bg-emerald-500',
+  no_context: 'bg-amber-400',
   thinking: 'bg-legalBlue animate-pulse',
   error: 'bg-red-500'
 };
@@ -93,6 +147,13 @@ const getDateInputValue = (daysFromToday = 0) => {
 
   return `${date.getFullYear()}-${month}-${day}`;
 };
+
+/** Une preguntas y alertas guardadas en una sola línea de tiempo (de la más antigua a la más reciente). */
+const buildFeedFromDetails = (questions = [], alerts = []) =>
+  [
+    ...questions.map((q) => ({ ...q, kind: 'question', key: `q-${q.id}`, variants: q.variants || [] })),
+    ...alerts.map((a) => ({ ...a, key: `a-${a.id}` }))
+  ].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
 
 const readToken = () => {
   try {
@@ -141,15 +202,38 @@ function useTypewriter(text, instant) {
   return { shown: text.slice(0, length), done: length >= text.length };
 }
 
+/** Devuelve true durante unos segundos desde que llegó algo nuevo (para resaltarlo). */
+function useFresh(createdAt, active, duration = 7000) {
+  const remaining = () => duration - (Date.now() - new Date(createdAt).getTime());
+  const [fresh, setFresh] = useState(() => active && remaining() > 0);
+
+  useEffect(() => {
+    if (!active) return undefined;
+
+    const left = remaining();
+    if (left <= 0) {
+      setFresh(false);
+      return undefined;
+    }
+
+    const timer = setTimeout(() => setFresh(false), left);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [createdAt, active, duration]);
+
+  return active && fresh;
+}
+
 // =================== Componentes de presentación ===================
 
-/** Tarjeta de una pregunta sugerida por el asistente. */
-function QuestionCard({ question }) {
+/** Etiqueta con el tipo de audiencia. */
+function TipoBadge({ tipo }) {
+  if (!tipo) return null;
+
   return (
-    <article className="bg-emerald-50 border border-emerald-100 rounded-lg p-4">
-      <p className="text-lg leading-snug text-gray-900">{question.question}</p>
-      <p className="text-sm text-emerald-700 mt-2">{formatTime(question.created_at)}</p>
-    </article>
+    <span className="inline-flex items-center rounded-md border border-blue-100 bg-blue-50 px-2 py-0.5 text-sm text-legalBlue">
+      {AUDIENCE_TYPE_LABEL[tipo] || tipo}
+    </span>
   );
 }
 
@@ -160,6 +244,208 @@ function EmptyState({ title, text }) {
       <p className="text-lg text-gray-600">{title}</p>
       {text && <p className="text-base text-gray-400 mt-1 max-w-sm">{text}</p>}
     </div>
+  );
+}
+
+// =================== Asistente: tarjetas y línea de tiempo ===================
+
+/** Estructura común de todas las tarjetas del asistente. */
+function FeedCard({ item, live, extraLabel, onDismiss, children }) {
+  const style = FEED_KINDS[item.kind] || FEED_KINDS.question;
+  const fresh = useFresh(item.created_at, live);
+
+  return (
+    <article
+      className={`border border-gray-200 border-l-4 rounded-lg p-4 transition-shadow ${style.card} ${fresh ? `ring-2 ${style.ring}` : ''
+        }`}
+    >
+      <div className="flex items-center justify-between gap-3 mb-3">
+        <div className="flex flex-wrap items-center gap-2 min-w-0">
+          <span className={`rounded-md px-2 py-0.5 text-xs font-semibold uppercase tracking-wide ${style.chip}`}>
+            {style.label}
+          </span>
+          {extraLabel && <span className="text-sm text-gray-500">{extraLabel}</span>}
+          {fresh && <span className="text-xs font-medium text-gray-500 motion-safe:animate-pulse">Nuevo</span>}
+        </div>
+
+        <span className="text-sm text-gray-400 shrink-0">{formatTime(item.created_at)}</span>
+      </div>
+
+      {children}
+
+      {onDismiss && (
+        <div className="mt-3 flex justify-end">
+          <button
+            type="button"
+            onClick={() => onDismiss(item.key)}
+            className="rounded-lg px-2 py-1 text-sm text-gray-400 hover:text-gray-700 hover:bg-gray-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-legalBlue"
+          >
+            Descartar
+          </button>
+        </div>
+      )}
+    </article>
+  );
+}
+
+/** Objeción: qué se dijo, por qué procede y la frase lista para decir en la audiencia. */
+function ObjectionCard(props) {
+  const { item } = props;
+
+  return (
+    <FeedCard {...props}>
+      <p className="text-lg font-semibold text-gray-900">{item.title}</p>
+
+      {item.quote && <p className="mt-2 text-base italic leading-relaxed text-gray-700">“{item.quote}”</p>}
+      {item.detail && <p className="mt-2 text-base text-gray-600">{item.detail}</p>}
+
+      {item.say && (
+        <div className="mt-3 rounded-lg border border-rose-200 bg-white px-4 py-3">
+          <p className="text-xs font-semibold uppercase tracking-wide text-rose-700">Puedes decir</p>
+          <p className="mt-1 text-lg font-medium leading-snug text-gray-900">{item.say}</p>
+        </div>
+      )}
+
+      {item.note && <p className="mt-3 text-sm text-gray-500">{item.note}</p>}
+    </FeedCard>
+  );
+}
+
+/** Pregunta sugerida: la mejor versión destacada y las alternativas debajo. */
+function QuestionItem(props) {
+  const { item } = props;
+  const variants = item.variants || [];
+
+  return (
+    <FeedCard {...props} extraLabel={QUESTION_CATEGORY_LABEL[item.category]}>
+      <div className="rounded-lg border border-emerald-100 bg-emerald-50 px-4 py-3">
+        <p className="text-xs font-semibold uppercase tracking-wide text-emerald-700">Mejor versión</p>
+        <p className="mt-1 text-xl leading-snug text-gray-900">{item.question}</p>
+      </div>
+
+      {variants.length > 0 && (
+        <ul className="mt-3 space-y-2">
+          {variants.map((variant) => (
+            <li key={variant.label} className="flex gap-3">
+              <span className="w-24 shrink-0 pt-0.5 text-sm text-gray-400">{variant.label}</span>
+              <span className="text-base leading-snug text-gray-700">{variant.text}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {item.reason && <p className="mt-3 text-sm text-gray-500">{item.reason}</p>}
+    </FeedCard>
+  );
+}
+
+/** Contradicción: lo dicho antes frente a lo dicho ahora. */
+function ContradictionCard(props) {
+  const { item } = props;
+
+  return (
+    <FeedCard {...props}>
+      <p className="text-lg font-semibold text-gray-900">{item.title}</p>
+
+      <div className="mt-3 grid gap-2 sm:grid-cols-2">
+        <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2">
+          <p className="text-xs font-semibold uppercase tracking-wide text-gray-400">Antes</p>
+          <p className="mt-1 text-base text-gray-700">“{item.quote_prev}”</p>
+        </div>
+        <div className="rounded-lg border border-amber-100 bg-amber-50 px-3 py-2">
+          <p className="text-xs font-semibold uppercase tracking-wide text-amber-700">Ahora</p>
+          <p className="mt-1 text-base text-gray-700">“{item.quote}”</p>
+        </div>
+      </div>
+
+      {item.detail && <p className="mt-3 text-base text-gray-600">{item.detail}</p>}
+    </FeedCard>
+  );
+}
+
+/** Dato importante mencionado en la audiencia. */
+function KeyDataCard(props) {
+  const { item } = props;
+
+  return (
+    <FeedCard {...props}>
+      <p className="text-sm font-semibold text-sky-800">{item.title}</p>
+      <p className="mt-1 text-lg leading-snug text-gray-900">{item.detail}</p>
+    </FeedCard>
+  );
+}
+
+const FEED_CARD_BY_KIND = {
+  objection: ObjectionCard,
+  question: QuestionItem,
+  contradiction: ContradictionCard,
+  key_data: KeyDataCard
+};
+
+/**
+ * Línea de tiempo del asistente (objeciones, preguntas, contradicciones y datos clave)
+ * con filtros. En vivo muestra además el aviso de "sin contexto suficiente".
+ */
+function AssistantFeed({ items, status, live, listClassName }) {
+  const [filter, setFilter] = useState('all');
+  const [dismissed, setDismissed] = useState(() => new Set());
+
+  const visibleItems = items.filter((item) => !dismissed.has(item.key));
+  const activeFilter = FEED_FILTERS.find((option) => option.id === filter) || FEED_FILTERS[0];
+  const shownItems = visibleItems.filter(activeFilter.match);
+
+  const dismiss = (key) => setDismissed((previous) => new Set(previous).add(key));
+
+  return (
+    <>
+      <div className="flex flex-wrap gap-2 px-5 py-3 border-b border-gray-200">
+        {FEED_FILTERS.map((option) => {
+          const count = visibleItems.filter(option.match).length;
+
+          return (
+            <button
+              key={option.id}
+              type="button"
+              onClick={() => setFilter(option.id)}
+              aria-pressed={filter === option.id}
+              className={`rounded-lg px-3 py-1.5 text-sm transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-legalBlue ${filter === option.id ? 'bg-gray-800 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                }`}
+            >
+              {option.label} <span className="opacity-70">{count}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      <div className={listClassName}>
+        {live && status?.state === 'no_context' && (
+          <div className="rounded-lg border border-dashed border-amber-300 bg-amber-50/60 px-4 py-3">
+            <p className="text-base font-medium text-amber-900">Aún no hay contexto suficiente</p>
+            <p className="mt-0.5 text-sm text-amber-800/80">
+              Sigo escuchando. Cuando la audiencia aporte más información, sugeriré la siguiente pregunta.
+            </p>
+          </div>
+        )}
+
+        {visibleItems.length === 0 ? (
+          <EmptyState
+            title={live ? 'Aún no hay sugerencias' : 'Sin sugerencias'}
+            text={
+              live
+                ? 'Las objeciones, preguntas y alertas aparecerán aquí a medida que avance la audiencia.'
+                : 'El asistente no generó nada en esta audiencia.'
+            }
+          />
+        ) : shownItems.length === 0 ? (
+          <EmptyState title="Nada en esta categoría" text="Prueba con otro filtro." />
+        ) : (
+          shownItems.map((item) => {
+            const Card = FEED_CARD_BY_KIND[item.kind] || QuestionItem;
+            return <Card key={item.key} item={item} live={live} onDismiss={live ? dismiss : undefined} />;
+          })
+        )}
+      </div>
+    </>
   );
 }
 
@@ -325,8 +611,8 @@ function HeroDemo() {
             onClick={() => setIndex(itemIndex)}
             aria-pressed={itemIndex === index}
             className={`rounded-lg border px-4 py-2 text-base transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-white ${itemIndex === index
-                ? 'bg-white text-legalBlue border-white'
-                : 'border-white/40 text-white hover:bg-white/10'
+              ? 'bg-white text-legalBlue border-white'
+              : 'border-white/40 text-white hover:bg-white/10'
               }`}
           >
             {item.label}
@@ -547,8 +833,8 @@ function UserBadges({ user }) {
     <div className="flex flex-wrap gap-2">
       <span
         className={`rounded-lg border px-2.5 py-1 text-sm ${user.activo
-            ? 'bg-emerald-50 border-emerald-100 text-emerald-700'
-            : 'bg-gray-100 border-gray-200 text-gray-600'
+          ? 'bg-emerald-50 border-emerald-100 text-emerald-700'
+          : 'bg-gray-100 border-gray-200 text-gray-600'
           }`}
       >
         {user.activo ? 'Activo' : 'Inactivo'}
@@ -1003,13 +1289,13 @@ function App() {
   const [session, setSession] = useState(null);
   const [transcription, setTranscription] = useState([]);
   const [interimTranscript, setInterimTranscript] = useState('');
-  const [aiQuestions, setAiQuestions] = useState([]);
+  const [aiFeed, setAiFeed] = useState([]);
   const [aiStatus, setAiStatus] = useState(INITIAL_AI_STATUS);
 
   // -- Detalle de una audiencia pasada --
   const [selectedSession, setSelectedSession] = useState(null);
   const [sessionDetails, setSessionDetails] = useState([]);
-  const [sessionAiQuestions, setSessionAiQuestions] = useState([]);
+  const [sessionFeed, setSessionFeed] = useState([]);
   const [loadingDetails, setLoadingDetails] = useState(false);
 
   // -- Formulario --
@@ -1163,14 +1449,14 @@ function App() {
     try {
       setLoadingDetails(true);
       setSessionDetails([]);
-      setSessionAiQuestions([]);
+      setSessionFeed([]);
       setSelectedSession(null);
 
       const data = await apiFetch(`/api/sessions/${sessionId}`);
 
       setSelectedSession(data.session);
       setSessionDetails(data.transcriptions);
-      setSessionAiQuestions(data.ai_questions || []);
+      setSessionFeed(buildFeedFromDetails(data.ai_questions, data.ai_alerts));
       setCurrentView('detail');
 
     } catch (error) {
@@ -1256,13 +1542,22 @@ function App() {
       });
     });
 
-    // -- Nueva pregunta generada por el LLM (la más reciente va primero) --
-    socket.on('new_question', (newQuestion) => {
-      setAiQuestions((prev) => {
+    // -- Todo lo que sugiere el asistente va a una sola línea de tiempo (lo más reciente primero) --
+    const addFeedItem = (item) => {
+      setAiFeed((prev) => {
         // Evitar duplicados si el servidor reenvía el evento.
-        if (newQuestion?.id && prev.some((q) => q.id === newQuestion.id)) return prev;
-        return [newQuestion, ...prev];
+        if (prev.some((existing) => existing.key === item.key)) return prev;
+        return [item, ...prev];
       });
+    };
+
+    socket.on('new_question', (question) => {
+      addFeedItem({ ...question, kind: 'question', key: `q-${question.id}`, variants: question.variants || [] });
+    });
+
+    // -- Objeciones, contradicciones y datos clave --
+    socket.on('new_alert', (alert) => {
+      addFeedItem({ ...alert, key: `a-${alert.id}` });
     });
 
     // -- Errores durante la sesión --
@@ -1313,6 +1608,10 @@ function App() {
       return Swal.fire('Falta el nombre', 'Escribe el nombre de la audiencia.', 'error');
     }
 
+    if (!formData.tipo) {
+      return Swal.fire('Falta el tipo', 'Selecciona el tipo de audiencia.', 'error');
+    }
+
     let stream = null;
 
     try {
@@ -1334,7 +1633,8 @@ function App() {
         method: 'POST',
         body: JSON.stringify({
           case_name: formData.case_name,
-          case_description: formData.case_description
+          case_description: formData.case_description,
+          tipo: formData.tipo
         })
       });
 
@@ -1343,7 +1643,7 @@ function App() {
       setSession(newSession);
       setTranscription([]);
       setInterimTranscript('');
-      setAiQuestions([]);
+      setAiFeed([]);
       setAiStatus({ state: 'idle', message: 'Conectando con el motor de transcripción' });
 
       // 4. Conectar Socket.IO y esperar a Deepgram.
@@ -1560,8 +1860,8 @@ function App() {
               <p
                 role="status"
                 className={`mb-6 rounded-lg border px-4 py-3 text-base ${authUser.suscripcion_activa
-                    ? 'border-emerald-100 bg-emerald-50 text-emerald-800'
-                    : 'border-red-100 bg-red-50 text-red-700'
+                  ? 'border-emerald-100 bg-emerald-50 text-emerald-800'
+                  : 'border-red-100 bg-red-50 text-red-700'
                   }`}
               >
                 {authUser.suscripcion_activa
@@ -1602,7 +1902,10 @@ function App() {
                     className="border border-gray-200 rounded-lg p-5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 hover:border-gray-300 transition-colors"
                   >
                     <div className="min-w-0">
-                      <h3 className="text-lg font-semibold text-legalBlue break-words">{s.case_name}</h3>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h3 className="text-lg font-semibold text-legalBlue break-words">{s.case_name}</h3>
+                        <TipoBadge tipo={s.tipo} />
+                      </div>
                       <p className="text-base text-gray-600 mt-1 break-words">
                         {s.case_description || 'Sin descripción'}
                       </p>
@@ -1647,6 +1950,36 @@ function App() {
                 />
               </div>
 
+              <fieldset>
+                <legend className="text-base font-medium text-gray-700 mb-3">Tipo de audiencia</legend>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {AUDIENCE_TYPES.map((type) => (
+                    <label
+                      key={type.value}
+                      className={`flex items-start gap-3 rounded-lg border px-4 py-3 text-base cursor-pointer transition-colors ${formData.tipo === type.value
+                        ? 'border-legalBlue bg-blue-50 text-legalBlue'
+                        : 'border-gray-300 hover:bg-gray-50'
+                        }`}
+                    >
+                      <input
+                        type="radio"
+                        name="tipo"
+                        value={type.value}
+                        required
+                        checked={formData.tipo === type.value}
+                        onChange={(e) => setFormData({ ...formData, tipo: e.target.value })}
+                        className="accent-legalBlue w-4 h-4 mt-1"
+                      />
+                      <span>
+                        {type.label}
+                        <span className="block text-sm text-gray-500">{type.hint}</span>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </fieldset>
+
               <div>
                 <label htmlFor="case_description" className="block text-base font-medium text-gray-700 mb-2">
                   Descripción del caso <span className="text-gray-400 font-normal">(opcional)</span>
@@ -1672,8 +2005,8 @@ function App() {
                     <label
                       key={option.value}
                       className={`flex items-center gap-3 rounded-lg border px-4 py-3 text-base cursor-pointer transition-colors ${formData.audioSource === option.value
-                          ? 'border-legalBlue bg-blue-50 text-legalBlue'
-                          : 'border-gray-300 hover:bg-gray-50'
+                        ? 'border-legalBlue bg-blue-50 text-legalBlue'
+                        : 'border-gray-300 hover:bg-gray-50'
                         }`}
                     >
                       <input
@@ -1715,7 +2048,10 @@ function App() {
 
             <div className={`${CARD} p-5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4`}>
               <div className="min-w-0">
-                <h2 className="text-xl font-semibold text-gray-800 break-words">{session?.case_name}</h2>
+                <div className="flex flex-wrap items-center gap-2">
+                  <h2 className="text-xl font-semibold text-gray-800 break-words">{session?.case_name}</h2>
+                  <TipoBadge tipo={session?.tipo} />
+                </div>
                 {session?.case_description && (
                   <p className="text-base text-gray-500 mt-1 break-words">{session.case_description}</p>
                 )}
@@ -1751,10 +2087,10 @@ function App() {
                 </div>
               </section>
 
-              {/* Panel derecho: preguntas sugeridas */}
-              <section className="bg-white border border-emerald-200 rounded-lg flex flex-col">
-                <div className="px-5 py-4 border-b border-emerald-100">
-                  <h2 className="text-lg font-semibold text-emerald-800">Preguntas sugeridas</h2>
+              {/* Panel derecho: asistente (objeciones, preguntas, contradicciones y datos clave) */}
+              <section className={`${CARD} flex flex-col`}>
+                <div className="px-5 py-4 border-b border-gray-200">
+                  <h2 className="text-lg font-semibold text-gray-800">Asistente</h2>
 
                   <p className="flex items-center gap-2 text-sm text-gray-500 mt-1" aria-live="polite">
                     <span className={`w-2 h-2 rounded-full shrink-0 ${STATUS_DOT[aiStatus.state] || STATUS_DOT.idle}`} />
@@ -1762,16 +2098,12 @@ function App() {
                   </p>
                 </div>
 
-                <div className="h-[50vh] lg:h-[65vh] overflow-y-auto p-5 space-y-3">
-                  {aiQuestions.length === 0 ? (
-                    <EmptyState
-                      title="Aún no hay preguntas"
-                      text="Aparecerán aquí en cuanto la audiencia aporte contexto suficiente."
-                    />
-                  ) : (
-                    aiQuestions.map((q) => <QuestionCard key={q.id} question={q} />)
-                  )}
-                </div>
+                <AssistantFeed
+                  items={aiFeed}
+                  status={aiStatus}
+                  live
+                  listClassName="h-[50vh] lg:h-[60vh] overflow-y-auto p-5 space-y-3"
+                />
               </section>
             </div>
           </div>
@@ -1784,7 +2116,7 @@ function App() {
             <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-8">
               <div>
                 <h2 className="text-xl sm:text-2xl font-semibold text-gray-800">Detalle de la audiencia</h2>
-                <p className="text-base text-gray-500 mt-1">Información, transcripción y preguntas sugeridas.</p>
+                <p className="text-base text-gray-500 mt-1">Información, transcripción y sugerencias del asistente.</p>
               </div>
 
               <button onClick={() => setCurrentView('list')} className={`${BTN_OUTLINE} w-full sm:w-auto`}>
@@ -1815,6 +2147,12 @@ function App() {
                     <div>
                       <dt className="text-sm text-gray-400">Fecha</dt>
                       <dd className="text-gray-700 mt-1">{formatDateTime(selectedSession.created_at)}</dd>
+                    </div>
+                    <div>
+                      <dt className="text-sm text-gray-400">Tipo</dt>
+                      <dd className="text-gray-700 mt-1">
+                        {AUDIENCE_TYPE_LABEL[selectedSession.tipo] || selectedSession.tipo || 'Sin tipo'}
+                      </dd>
                     </div>
                     <div>
                       <dt className="text-sm text-gray-400">Estado</dt>
@@ -1851,21 +2189,17 @@ function App() {
                   </div>
                 </div>
 
-                {/* Preguntas sugeridas */}
+                {/* Sugerencias del asistente */}
                 <div>
-                  <h3 className="text-lg font-semibold text-emerald-800 mb-4">Preguntas sugeridas</h3>
+                  <h3 className="text-lg font-semibold text-gray-800 mb-4">Asistente</h3>
 
-                  {sessionAiQuestions.length === 0 ? (
-                    <div className="border border-dashed border-gray-300 rounded-lg">
-                      <EmptyState title="Sin preguntas" text="No se generaron preguntas en esta audiencia." />
-                    </div>
-                  ) : (
-                    <div className="space-y-3">
-                      {sessionAiQuestions.map((q) => (
-                        <QuestionCard key={q.id} question={q} />
-                      ))}
-                    </div>
-                  )}
+                  <div className="border border-gray-200 rounded-lg">
+                    <AssistantFeed
+                      items={sessionFeed}
+                      live={false}
+                      listClassName="max-h-[70vh] overflow-y-auto p-5 space-y-3"
+                    />
+                  </div>
                 </div>
               </div>
             )}
