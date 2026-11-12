@@ -22,14 +22,15 @@ const deepgram = new DeepgramClient({
 // =================== Configuración del LLM (Ollama) ===================
 const ollama = require('./config/ollama');
 
-// OPTIMIZACIÓN: Ajustes drásticos de contexto y memoria para equipos de bajos recursos.
-// Menos tokens enviados = menor uso de CPU y mayor velocidad de inferencia.
+// OPTIMIZACIÓN: Ajustes para modelos básicos en hardware limitado.
+// Se eliminaron las ventanas de contexto previo (recentContext) para forzar al modelo 
+// a enfocarse 100% en el texto nuevo, evitando que recicle temas pasados.
 const LLM_CONFIG = {
     model: process.env.OLLAMA_MODEL || 'qwen3:0.6b',
     fastModel: process.env.OLLAMA_FAST_MODEL || process.env.OLLAMA_MODEL || 'qwen3:0.6b',
-    timeoutMs: 60000,            // Aumentado: da más margen en caso de peticiones encoladas
-    keepAlive: '15m',            // Reducido: libera la RAM (8GB max) más rápido si no hay audiencias
-    numCtx: 1024,                // Reducido (antes 2048): acelera muchísimo el procesamiento del prompt en CPU
+    timeoutMs: 60000,
+    keepAlive: '15m',
+    numCtx: 1024,
     similarityThreshold: 0.7,
     noContextToken: 'SIN_CONTEXTO',
     nothingToken: 'NADA',
@@ -37,22 +38,20 @@ const LLM_CONFIG = {
     // -- Carril de preguntas --
     questions: {
         minNewChars: 70,
-        maxNewChars: 1200,       // Reducido (antes 1800): envía menos texto nuevo a la vez
-        recentContextChars: 800, // Reducido (antes 1500): menos historial para procesar
-        maxHistory: 4,           // Reducido (antes 15): alivia fuertemente la carga cognitiva del modelo
-        numPredict: 200,         // Ajustado
+        maxNewChars: 1200,
+        maxHistory: 4,           // Solo recuerda las últimas 4 preguntas para no repetirlas
+        numPredict: 200,
         temperature: 0.3,
         minWords: 4,
         maxWords: 40,
         maxChars: 300
     },
 
-    // -- Carril de objeciones (el más sensible al tiempo) --
+    // -- Carril de objeciones --
     objections: {
         minChars: 20,
         earlyMinChars: 25,
-        recentContextChars: 400, // Reducido (antes 700)
-        maxTextChars: 400,       // Reducido (antes 700)
+        maxTextChars: 400,
         maxPerTurn: 2,
         numPredict: 100,
         temperature: 0.1
@@ -61,9 +60,9 @@ const LLM_CONFIG = {
     // -- Carril de contradicciones y datos clave --
     insights: {
         minNewChars: 90,
-        maxNewChars: 1000,       // Reducido (antes 1500)
-        historyChars: 1200,      // Reducido (antes 2500): crítico para evitar cuellos de botella en CPU
-        maxReported: 4,          // Reducido (antes 10)
+        maxNewChars: 1000,
+        historyChars: 1200,      // Este es el único carril que mantiene historial (para buscar contradicciones)
+        maxReported: 4,
         maxPerTurn: 2,
         numPredict: 120,
         temperature: 0.2
@@ -80,26 +79,22 @@ if (!JWT_SECRET || JWT_SECRET.length < 16) {
 
 const AUTH_CONFIG = {
     jwtExpiresIn: process.env.JWT_EXPIRES_IN || '8h',
-    bcryptRounds: 10,                                       // Optimizado (antes 12): 10 es seguro y reduce picos de CPU
-    timezone: process.env.APP_TIMEZONE || 'America/Bogota', // Zona para evaluar el vencimiento
-    loginMaxAttempts: 8,                                    // Intentos fallidos permitidos...
-    loginWindowMs: 15 * 60 * 1000                           // ...dentro de esta ventana de tiempo
+    bcryptRounds: 10,
+    timezone: process.env.APP_TIMEZONE || 'America/Bogota',
+    loginMaxAttempts: 8,
+    loginWindowMs: 15 * 60 * 1000
 };
 
-// -- Administrador inicial: se inserta solo si aún no existe ninguno --
+// -- Administrador inicial --
 const DEFAULT_ADMIN = {
     nombre: process.env.ADMIN_NAME || 'Administrador',
     correo: (process.env.ADMIN_EMAIL || 'admin@asistente.com').toLowerCase(),
     password: process.env.ADMIN_PASSWORD || 'Admin123*'
 };
 
-// Hash falso para igualar tiempos de respuesta cuando el correo no existe.
 const DUMMY_HASH = bcrypt.hashSync('contraseña-inexistente', AUTH_CONFIG.bcryptRounds);
 
 // =================== Errores controlados ===================
-/**
- * Error con un mensaje seguro de mostrar al cliente y su código HTTP.
- */
 class AppError extends Error {
     constructor(message, status = 400) {
         super(message);
@@ -107,19 +102,13 @@ class AppError extends Error {
     }
 }
 
-/**
- * Responde un error: los controlados con su mensaje, el resto como error genérico.
- */
 const handleError = (res, error, fallbackMessage) => {
     if (error instanceof AppError) {
         return res.status(error.status).json({ error: error.message });
     }
-
-    // Violación de unicidad (correo repetido).
     if (error?.code === '23505') {
         return res.status(409).json({ error: 'Ya existe un usuario con ese correo.' });
     }
-
     console.error(`[BACKEND] ${fallbackMessage}:`, error);
     return res.status(500).json({ error: fallbackMessage });
 };
@@ -129,78 +118,68 @@ const AUDIENCE_TYPES = ['penal', 'civil', 'laboral', 'administrativo'];
 const DEFAULT_AUDIENCE_TYPE = 'penal';
 const JURISDICTION = process.env.APP_JURISDICTION || 'Colombia';
 
-// =================== Prompts base por tipo de audiencia ===================
+// =================== Prompts base ===================
 const PROMPTS_POR_TIPO = {
-    penal: `Eres un asistente de apoyo en tiempo real para un abogado que participa en una audiencia PENAL en ${JURISDICTION} (fiscalía, defensa, víctima, testigos, peritos y juez).
-Tu enfoque: los hechos y sus circunstancias de tiempo, modo y lugar; la fuente del conocimiento del testigo (si vio, oyó o le contaron); la coherencia y credibilidad de los testimonios; la identificación de personas y objetos; la cadena de custodia y las pruebas; la teoría del caso (tipicidad, antijuridicidad, culpabilidad) y las garantías procesales.`,
+    penal: `Eres un asistente de apoyo en tiempo real para un abogado que participa en una audiencia PENAL en ${JURISDICTION}.
+Enfoque: hechos, tiempo, modo, lugar, fuente del conocimiento, coherencia de testimonios y garantías procesales.`,
 
-    civil: `Eres un asistente de apoyo en tiempo real para un abogado que participa en una audiencia CIVIL en ${JURISDICTION} (demandante, demandado, apoderados, testigos, peritos y juez).
-Tu enfoque: la existencia y el contenido de la obligación o del contrato; el incumplimiento y sus causas; los pagos y los documentos que los acreditan; los daños y su cuantía; el nexo causal; la carga de la prueba; las excepciones (prescripción, pago, mala fe) y las pretensiones y defensas de cada parte.`,
+    civil: `Eres un asistente de apoyo en tiempo real para un abogado que participa en una audiencia CIVIL en ${JURISDICTION}.
+Enfoque: obligaciones, contratos, incumplimientos, pagos, daños, nexo causal y excepciones.`,
 
-    laboral: `Eres un asistente de apoyo en tiempo real para un abogado que participa en una audiencia LABORAL en ${JURISDICTION} (trabajador, empleador, apoderados, testigos y juez).
-Tu enfoque: la existencia de la relación laboral y sus elementos (prestación personal del servicio, subordinación, salario); la jornada y las horas extras; el pago de salarios, prestaciones y aportes a seguridad social; la terminación del contrato (justa causa, despido, indemnización); los accidentes y riesgos laborales; y la prueba de cada punto (documentos y testigos).`,
+    laboral: `Eres un asistente de apoyo en tiempo real para un abogado que participa en una audiencia LABORAL en ${JURISDICTION}.
+Enfoque: relación laboral, salario, jornada, terminación del contrato, indemnizaciones y accidentes.`,
 
-    administrativo: `Eres un asistente de apoyo en tiempo real para un abogado que participa en una audiencia ADMINISTRATIVA en ${JURISDICTION} (particular o demandante, entidad pública, apoderados, testigos, peritos y juez o magistrado).
-Tu enfoque: el acto, hecho, omisión u operación administrativa discutida; la competencia y la legalidad (motivación, debido proceso, desviación de poder); la falla del servicio, el daño antijurídico y el nexo causal; la actuación de la entidad y los documentos del expediente administrativo; la oportunidad (caducidad) y las pretensiones (nulidad y restablecimiento del derecho, reparación directa, controversias contractuales).`
+    administrativo: `Eres un asistente de apoyo en tiempo real para un abogado que participa en una audiencia ADMINISTRATIVA en ${JURISDICTION}.
+Enfoque: acto u omisión administrativa, legalidad, falla del servicio, daño antijurídico y restablecimiento del derecho.`
 };
 
-// -- Nota común sobre la calidad de la transcripción (aplica a todos los tipos y carriles) --
 const TRANSCRIPTION_NOTES = `Sobre la transcripción:
-- Es automática, en vivo y no indica quién habla. Puede tener palabras mal reconocidas (homófonos, nombres propios deformados, cifras o fechas mal escritas, frases cortadas o sin puntuación).
-- Interpreta por el sentido del contexto y deduce quién habla (juez, fiscal o abogado, testigo, parte) a partir de lo que dice. Haz el mayor esfuerzo por entender lo que se quiso decir.
-- Si una palabra dudosa cambia el sentido de un hecho importante, no la des por cierta.
-- Nunca inventes nombres, fechas, lugares ni hechos que no estén en el texto.`;
+- Es automática y en vivo. Deduzca quién habla por el contexto.
+- Nunca inventes nombres, fechas, lugares ni hechos que no estén en el texto provisto.`;
 
-// -- Instrucciones de formato por carril: no dependen del tipo de audiencia --
 const INSTRUCCIONES_PREGUNTAS = `Tu tarea: proponer UNA pregunta que el abogado pueda formular a continuación, junto con dos versiones alternativas.
 
 Responde con UNA sola línea JSON, sin markdown ni texto adicional:
-{"q":"<mejor versión>","directa":"<versión más directa o cerrada>","abierta":"<versión más abierta>","enfoque":"<aclarar|precisar|verificar|cuestionar|profundizar>","porque":"<motivo en máximo 12 palabras>"}
+{"q":"<mejor versión>","directa":"<versión más directa>","abierta":"<versión más abierta>","enfoque":"<aclarar|precisar|verificar|cuestionar|profundizar>","porque":"<motivo en máximo 12 palabras>"}
 
 Reglas:
-1. Cada pregunta va en español, entre signos de interrogación, y es UNA sola pregunta (nunca compuesta). Máximo ${LLM_CONFIG.questions.maxWords} palabras cada una.
-2. Basa las preguntas solo en hechos, afirmaciones o contradicciones presentes en el TEXTO NUEVO. El CONTEXTO PREVIO es solo referencia.
-3. Deben ser concretas y útiles: aclarar, precisar, verificar o cuestionar lo dicho (tiempo, modo, lugar, fuente del conocimiento, coherencia). No uses preguntas capciosas ni especulativas, y evita las sugestivas.
-4. "q" es la mejor de las tres. Las tres deben ser realmente distintas entre sí.
-5. No repitas ni reformules ninguna de las PREGUNTAS YA SUGERIDAS.
-6. Si el TEXTO NUEVO solo tiene saludos, identificaciones, trámites, frases sueltas o información que no permita una pregunta útil, responde exactamente: ${LLM_CONFIG.noContextToken}`;
+1. Cada pregunta va en español, entre signos de interrogación, y es UNA sola pregunta (nunca compuesta). Máximo ${LLM_CONFIG.questions.maxWords} palabras.
+2. Basa las preguntas ESTRICTAMENTE en los hechos presentes en el TEXTO NUEVO. No inventes contexto ajeno a este bloque de texto.
+3. Deben ser concretas y útiles. No uses preguntas capciosas ni especulativas.
+4. No repitas ni reformules ninguna de las PREGUNTAS YA SUGERIDAS.
+5. Si el TEXTO NUEVO solo tiene saludos, formalidades o información irrelevante, responde exactamente: ${LLM_CONFIG.noContextToken}`;
 
-const INSTRUCCIONES_OBJECIONES = `Tu tarea: detectar, en la ÚLTIMA INTERVENCIÓN, preguntas formuladas en voz alta que merezcan una objeción. Solo evalúas preguntas (no respuestas ni afirmaciones).
+const INSTRUCCIONES_OBJECIONES = `Tu tarea: detectar, en la ÚLTIMA INTERVENCIÓN, preguntas formuladas en voz alta que merezcan una objeción. Solo evalúas preguntas.
 
 Tipos de objeción (usa exactamente el identificador):
-- capciosa: utiliza engaño, artificio o inducción a error para lograr que el testigo responda algo que no desea o que es falso.
-- sugestiva: sugiere o insinúa la respuesta dentro de la misma pregunta.
-- impertinente: no guarda relación con los hechos del debate ni con la teoría del caso.
-- ambigua: es tan imprecisa, confusa o vaga que el testigo no puede entender qué se le pregunta.
+- capciosa: utiliza engaño o inducción a error.
+- sugestiva: sugiere la respuesta dentro de la misma pregunta.
+- impertinente: no guarda relación con los hechos.
+- ambigua: imprecisa, confusa o vaga.
 - compuesta: contiene dos o más preguntas en una sola.
-- repetitiva: insiste sobre un punto que ya fue respondido.
-- especulativa: pide al testigo suponer, imaginar o conjeturar sobre hechos que no le constan.
+- repetitiva: insiste sobre un punto ya respondido.
+- especulativa: pide suponer o imaginar.
 
-Responde con una línea JSON por objeción (máximo ${LLM_CONFIG.objections.maxPerTurn}), sin markdown ni texto adicional:
+Responde con una línea JSON por objeción, sin markdown:
 {"t":"<identificador>","cita":"<la pregunta tal como se transcribió, máximo 25 palabras>","motivo":"<por qué procede, máximo 14 palabras>"}
 
 Reglas:
 1. Señala solo cuando sea claro. Ante la duda, responde exactamente: ${LLM_CONFIG.nothingToken}
-2. Si la intervención no contiene ninguna pregunta objetable, responde exactamente: ${LLM_CONFIG.nothingToken}
-3. Un error de transcripción no es motivo de objeción.`;
+2. Si no contiene preguntas objetables, responde exactamente: ${LLM_CONFIG.nothingToken}`;
 
 const INSTRUCCIONES_HALLAZGOS = `Tu tarea: revisar el TEXTO NUEVO, comparándolo con el HISTORIAL, para detectar:
-- contradiccion: el texto nuevo contradice o es inconsistente con algo dicho antes.
+- contradiccion: el texto nuevo contradice algo dicho antes.
 - dato: un dato importante para el caso que el abogado debe tener presente.
 
-Responde con una línea JSON por hallazgo (máximo ${LLM_CONFIG.insights.maxPerTurn}), sin markdown ni texto adicional:
-{"k":"contradiccion","titulo":"<máximo 6 palabras>","antes":"<lo dicho antes>","ahora":"<lo dicho ahora>","detalle":"<por qué se contradicen, máximo 20 palabras>"}
-{"k":"dato","titulo":"<tipo de dato, máximo 4 palabras>","detalle":"<el dato concreto, máximo 20 palabras>"}
+Responde con una línea JSON por hallazgo, sin markdown:
+{"k":"contradiccion","titulo":"<máximo 6 palabras>","antes":"<lo dicho antes>","ahora":"<lo dicho ahora>","detalle":"<por qué se contradicen>"}
+{"k":"dato","titulo":"<tipo de dato>","detalle":"<dato concreto, máximo 20 palabras>"}
 
 Reglas:
-1. Reporta contradicciones solo si son reales. Una diferencia por posible error de transcripción NO es contradicción.
-2. Reporta únicamente datos relevantes para el caso; ignora saludos, trámites y frases sin contenido.
-3. No repitas los HALLAZGOS YA REPORTADOS.
-4. Si no hay nada que reportar, responde exactamente: ${LLM_CONFIG.nothingToken}`;
+1. Reporta contradicciones solo si son reales.
+2. Ignora saludos y frases sin contenido.
+3. Si no hay nada que reportar, responde exactamente: ${LLM_CONFIG.nothingToken}`;
 
-/**
- * Arma el prompt de sistema de cada carril
- */
 const buildSystemPrompts = (tipo) => {
     const domain = PROMPTS_POR_TIPO[tipo] || PROMPTS_POR_TIPO[DEFAULT_AUDIENCE_TYPE];
     const compose = (instructions) => `${domain}\n\n${TRANSCRIPTION_NOTES}\n\n${instructions}`;
@@ -212,25 +191,25 @@ const buildSystemPrompts = (tipo) => {
     };
 };
 
-// =================== Mensajes de usuario por carril ===================
+// =================== Constructores de Prompts de Usuario ===================
 const caseHeader = (caseName, caseDescription) => [
     `CASO: ${caseName || 'Sin título'}`,
     caseDescription ? `DESCRIPCIÓN: ${String(caseDescription).slice(0, 600)}` : null
 ];
 
-const buildQuestionsPrompt = ({ caseName, caseDescription, recentContext, askedQuestions, newText }) =>
+// Eliminado el "CONTEXTO PREVIO" para aislar el modelo estrictamente en el bloque de audio recién dicho.
+const buildQuestionsPrompt = ({ caseName, caseDescription, askedQuestions, newText }) =>
     [
         ...caseHeader(caseName, caseDescription),
-        `CONTEXTO PREVIO: ${recentContext || '(ninguno)'}`,
         'PREGUNTAS YA SUGERIDAS:',
         askedQuestions.length ? askedQuestions.map((q) => `- ${q}`).join('\n') : '(ninguna)',
         `TEXTO NUEVO: ${newText}`
     ].filter(Boolean).join('\n');
 
-const buildObjectionsPrompt = ({ caseName, caseDescription, recentContext, lastTurn }) =>
+// Eliminado el "CONTEXTO RECIENTE" para objeciones. Evalúa puramente lo que acaba de escuchar.
+const buildObjectionsPrompt = ({ caseName, caseDescription, lastTurn }) =>
     [
         ...caseHeader(caseName, caseDescription),
-        `CONTEXTO RECIENTE: ${recentContext || '(ninguno)'}`,
         `ÚLTIMA INTERVENCIÓN: ${lastTurn}`
     ].filter(Boolean).join('\n');
 
@@ -243,7 +222,7 @@ const buildInsightsPrompt = ({ caseName, caseDescription, history, reported, new
         `TEXTO NUEVO: ${newText}`
     ].filter(Boolean).join('\n');
 
-// -- Ejemplos (few-shot) por carril --
+// =================== Ejemplos (few-shot) actualizados sin contexto ===================
 const EXAMPLE_CASE = 'Caso de ejemplo';
 
 const QUESTIONS_FEW_SHOT = [
@@ -251,7 +230,6 @@ const QUESTIONS_FEW_SHOT = [
         role: 'user',
         content: buildQuestionsPrompt({
             caseName: EXAMPLE_CASE,
-            recentContext: '',
             askedQuestions: [],
             newText: 'Buenos días, señoría. Me presento, soy el testigo, vivo en el barrio San José y fui citado para declarar en esta audiencia.'
         })
@@ -261,7 +239,6 @@ const QUESTIONS_FEW_SHOT = [
         role: 'user',
         content: buildQuestionsPrompt({
             caseName: EXAMPLE_CASE,
-            recentContext: '',
             askedQuestions: [],
             newText: 'Yo vi cuando el señor salió corriendo de la tienda con una caja en la mano. Eso fue como a las nueve de la noche, yo estaba en la esquina esperando un bus y no alcancé a verle bien la cara.'
         })
@@ -283,7 +260,6 @@ const OBJECTIONS_FEW_SHOT = [
         role: 'user',
         content: buildObjectionsPrompt({
             caseName: EXAMPLE_CASE,
-            recentContext: '',
             lastTurn: 'Buenos días, señor testigo. ¿Podría decirnos su nombre completo y a qué se dedica?'
         })
     },
@@ -292,7 +268,6 @@ const OBJECTIONS_FEW_SHOT = [
         role: 'user',
         content: buildObjectionsPrompt({
             caseName: EXAMPLE_CASE,
-            recentContext: 'Yo estaba en la esquina esperando un bus.',
             lastTurn: '¿Es cierto que usted vio al señor salir corriendo de la tienda a las nueve de la noche con la caja en la mano?'
         })
     },
@@ -329,8 +304,6 @@ const INSIGHTS_FEW_SHOT = [
 ];
 
 // =================== Utilidades del LLM ===================
-
-/** Texto en minúsculas, sin tildes ni signos (para comparar). */
 const canon = (text = '') =>
     String(text)
         .toLowerCase()
@@ -340,19 +313,15 @@ const canon = (text = '') =>
         .replace(/\s+/g, ' ')
         .trim();
 
-/** Identificador en solo letras. */
 const normalizeKey = (value = '') => canon(value).replace(/[^a-z]/g, '');
 
-/** Recorta un texto a un máximo de caracteres. */
 const clip = (value, max) => {
     const text = String(value || '').replace(/\s+/g, ' ').trim();
     return text.length > max ? `${text.slice(0, max - 1).trim()}…` : text;
 };
 
-/** Conjunto de palabras relevantes. */
 const toWordSet = (text) => new Set(canon(text).split(' ').filter((word) => word.length > 3));
 
-/** Similitud de Jaccard entre dos textos (0 a 1). */
 const similarity = (a, b) => {
     const first = toWordSet(a);
     const second = toWordSet(b);
@@ -363,13 +332,9 @@ const similarity = (a, b) => {
     return union > 0 ? intersection / union : 0;
 };
 
-/** Indica si un texto es casi idéntico a alguno del historial. */
 const isDuplicateQuestion = (question, history, threshold = LLM_CONFIG.similarityThreshold) =>
     history.some((previous) => similarity(question, previous) >= threshold);
 
-/**
- * Limpia un texto generado por el modelo.
- */
 const cleanQuestion = (raw = '') => {
     const cfg = LLM_CONFIG.questions;
 
@@ -415,7 +380,6 @@ const OBJECTION_TYPES = {
 
 const QUESTION_CATEGORIES = ['aclarar', 'precisar', 'verificar', 'cuestionar', 'profundizar'];
 
-/** Convierte lo que devolvió el modelo en una pregunta. */
 const parseQuestion = (obj, askedAll) => {
     const main = cleanQuestion(obj?.q);
     if (!main) return { status: 'invalid' };
@@ -445,7 +409,6 @@ const parseQuestion = (obj, askedAll) => {
     };
 };
 
-/** Convierte lo que devolvió el modelo en una objeción. */
 const parseObjection = (obj) => {
     const key = normalizeKey(obj?.t);
     const type = Object.keys(OBJECTION_TYPES).find((name) => key === name || key.includes(name));
@@ -469,7 +432,6 @@ const parseObjection = (obj) => {
     };
 };
 
-/** Convierte lo que devolvió el modelo en una contradicción o en un dato clave. */
 const parseInsight = (obj) => {
     const key = normalizeKey(obj?.k);
 
@@ -520,26 +482,18 @@ const isDuplicateAlert = (alert, history) =>
     );
 
 // =================== Gestor de concurrencia del LLM ===================
-// OPTIMIZACIÓN: Para un equipo de 2 núcleos y memoria limitada, lanzar múltiples
-// inferencias de LLM en paralelo genera saturación (thrashing) y caídas de CPU.
-// Se implementa un Mutex global para procesar cada petición secuencialmente, 
-// lo cual es radicalmente más rápido en entornos constreñidos.
 const llmMutex = {
     current: Promise.resolve(),
     lock() {
         let release;
         const next = new Promise(resolve => { release = resolve; });
         const wait = this.current;
-        this.current = wait.then(() => next, () => next); // Continuar incluso si la anterior falla
+        this.current = wait.then(() => next, () => next);
         return { wait, release };
     }
 };
 
-/**
- * Llama a Ollama en streaming respetando el encolamiento secuencial.
- */
 const streamFromLLM = async ({ model = LLM_CONFIG.model, messages, numPredict, temperature = 0.2 }, onObject) => {
-    // 1. Esperar el turno en la cola (Mutex)
     const { wait, release } = llmMutex.lock();
     await wait;
 
@@ -556,12 +510,11 @@ const streamFromLLM = async ({ model = LLM_CONFIG.model, messages, numPredict, t
     });
     timeout.catch(() => { });
 
-    // 2. Realizar la llamada, explotando los 2 hilos disponibles (ya que es la única ejecutándose)
     const call = ollama.chat({
         model,
         messages,
         stream: true,
-        // think: true,
+        // think: false,
         keep_alive: LLM_CONFIG.keepAlive,
         options: {
             temperature,
@@ -569,7 +522,7 @@ const streamFromLLM = async ({ model = LLM_CONFIG.model, messages, numPredict, t
             repeat_penalty: 1.1,
             num_ctx: LLM_CONFIG.numCtx,
             num_predict: numPredict,
-            num_thread: 1, // Optimización crítica: forzar exactamente 2 hilos para usar el CPU eficientemente
+            num_thread: 1,
         }
     });
     call.catch(() => { });
@@ -587,7 +540,6 @@ const streamFromLLM = async ({ model = LLM_CONFIG.model, messages, numPredict, t
             full += chunk;
             buffer += chunk;
 
-            // Extrae objetos JSON conforme se generan
             let match;
             while ((match = /\{[^{}]*\}/.exec(buffer))) {
                 buffer = buffer.slice(match.index + match[0].length);
@@ -596,7 +548,6 @@ const streamFromLLM = async ({ model = LLM_CONFIG.model, messages, numPredict, t
                 try {
                     parsed = JSON.parse(match[0]);
                 } catch {
-                    // Objeto mal formado: se ignora.
                 }
 
                 if (parsed && onObject) await onObject(parsed);
@@ -607,18 +558,13 @@ const streamFromLLM = async ({ model = LLM_CONFIG.model, messages, numPredict, t
         throw error;
     } finally {
         clearTimeout(timer);
-        release(); // 3. Liberar el bloqueo para la siguiente tarea en la cola
+        release();
     }
 
     return full.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 };
 
 // =================== Motor del asistente en vivo ===================
-/**
- * Un motor por conexión. Recibe la transcripción (parcial y final) y, en tres
- * carriles lógicos, genera: objeciones, contradicciones / datos clave y
- * preguntas sugeridas. (Físicamente encolados por llmMutex).
- */
 const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQuestion, onAlert }) => {
     const prompts = buildSystemPrompts(tipo);
 
@@ -629,19 +575,14 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
 
     let isActive = true;
 
-    // -- Preguntas --
     let questionCursor = 0;
     let questionChars = 0;
     let questionOutcome = 'idle';
 
-    // -- Contradicciones y datos --
     let insightCursor = 0;
     let insightChars = 0;
 
-    // -- Objeciones --
     let lastObjectionText = '';
-
-    // -- Estado --
     let heavyInFlight = 0;
     let hasError = false;
     let lastStatusKey = '';
@@ -667,10 +608,6 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
         onStatus(status);
     };
 
-    /**
-     * Un carril ejecuta una tarea a la vez. Las peticiones a LLM se enviarán
-     * al mutex central automáticamente.
-     */
     const createLane = ({ name, heavy, canRun, execute }) => {
         let running = false;
         let queued = null;
@@ -717,12 +654,9 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
     const runObjections = createLane({
         name: 'objeciones',
         heavy: false,
-        execute: async ({ text, contextEnd }) => {
+        execute: async ({ text }) => {
             const cfg = LLM_CONFIG.objections;
-
             const lastTurn = text.slice(-cfg.maxTextChars);
-            const recentContext = segments.slice(0, contextEnd).join(' ').slice(-cfg.recentContextChars);
-
             let count = 0;
 
             await streamFromLLM(
@@ -735,7 +669,7 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
                         ...OBJECTIONS_FEW_SHOT,
                         {
                             role: 'user',
-                            content: buildObjectionsPrompt({ caseName, caseDescription, recentContext, lastTurn })
+                            content: buildObjectionsPrompt({ caseName, caseDescription, lastTurn })
                         }
                     ]
                 },
@@ -762,7 +696,6 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
         canRun: () => insightChars >= LLM_CONFIG.insights.minNewChars,
         execute: async () => {
             const cfg = LLM_CONFIG.insights;
-
             insightChars = 0;
 
             const snapshot = segments.length;
@@ -813,12 +746,10 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
         canRun: () => questionChars >= LLM_CONFIG.questions.minNewChars,
         execute: async () => {
             const cfg = LLM_CONFIG.questions;
-
             questionChars = 0;
 
             const snapshot = segments.length;
             const newText = segments.slice(questionCursor, snapshot).join(' ').slice(-cfg.maxNewChars);
-            const recentContext = segments.slice(0, questionCursor).join(' ').slice(-cfg.recentContextChars);
 
             let emitted = false;
             let sawDuplicate = false;
@@ -835,7 +766,6 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
                             content: buildQuestionsPrompt({
                                 caseName,
                                 caseDescription,
-                                recentContext,
                                 askedQuestions: askedMain.slice(-cfg.maxHistory),
                                 newText
                             })
@@ -893,7 +823,7 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
 
             if (clean.length >= objectionCfg.minChars && canon(clean) !== canon(lastObjectionText)) {
                 lastObjectionText = clean;
-                void runObjections({ text: clean, contextEnd: segments.length - 1 });
+                void runObjections({ text: clean });
             }
 
             void runInsights();
@@ -910,7 +840,7 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
             if (canon(clean) === canon(lastObjectionText)) return;
 
             lastObjectionText = clean;
-            void runObjections({ text: clean, contextEnd: segments.length });
+            void runObjections({ text: clean });
         },
 
         stop() {
@@ -920,7 +850,6 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
 };
 
 // =================== Usuarios: utilidades ===================
-
 const USER_COLUMNS = `id, nombre, correo, rol, to_char(vencimiento, 'YYYY-MM-DD') AS vencimiento, activo, created_at`;
 
 const getToday = () =>
@@ -1016,7 +945,6 @@ const parseId = (value) => {
 };
 
 // =================== Autenticación: utilidades y middlewares ===================
-
 const signToken = (user) =>
     jwt.sign({ sub: String(user.id), rol: user.rol }, JWT_SECRET, {
         algorithm: 'HS256',
@@ -1101,7 +1029,7 @@ setInterval(() => {
     }
 }, 10 * 60 * 1000).unref();
 
-// =================== Base de datos: esquema y administrador inicial ===================
+// =================== Base de datos: esquema ===================
 const initializeDatabase = async () => {
     await pool.query(`
         CREATE TABLE IF NOT EXISTS users (
@@ -1169,10 +1097,6 @@ const initializeDatabase = async () => {
         );
 
         console.log(`[BACKEND] Administrador inicial creado: ${DEFAULT_ADMIN.correo}`);
-
-        if (!process.env.ADMIN_PASSWORD) {
-            console.warn('[BACKEND] Usa ADMIN_PASSWORD en el .env y cambia la contraseña por defecto.');
-        }
     }
 };
 
