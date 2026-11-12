@@ -561,7 +561,7 @@ const streamFromLLM = async ({ model = LLM_CONFIG.model, messages, numPredict, t
         model,
         messages,
         stream: true,
-        think: true,
+        // think: true,
         keep_alive: LLM_CONFIG.keepAlive,
         options: {
             temperature,
