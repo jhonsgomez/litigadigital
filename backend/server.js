@@ -22,23 +22,25 @@ const deepgram = new DeepgramClient({
 // =================== Configuración del LLM (Ollama) ===================
 const ollama = require('./config/ollama');
 
+// OPTIMIZACIÓN: Ajustes drásticos de contexto y memoria para equipos de bajos recursos.
+// Menos tokens enviados = menor uso de CPU y mayor velocidad de inferencia.
 const LLM_CONFIG = {
-    model: process.env.OLLAMA_MODEL || 'qwen3.5:4b',
-    fastModel: process.env.OLLAMA_FAST_MODEL || process.env.OLLAMA_MODEL || 'qwen3.5:4b',
-    timeoutMs: 45000,            // Tiempo máximo de espera por respuesta del modelo
-    keepAlive: '60m',            // Mantiene el modelo cargado en memoria
-    numCtx: 2048,                // Igual en todas las llamadas (ver nota arriba)
-    similarityThreshold: 0.7,    // Similitud (Jaccard) a partir de la cual algo es duplicado
+    model: process.env.OLLAMA_MODEL || 'qwen3:0.6b',
+    fastModel: process.env.OLLAMA_FAST_MODEL || process.env.OLLAMA_MODEL || 'qwen3:0.6b',
+    timeoutMs: 60000,            // Aumentado: da más margen en caso de peticiones encoladas
+    keepAlive: '15m',            // Reducido: libera la RAM (8GB max) más rápido si no hay audiencias
+    numCtx: 1024,                // Reducido (antes 2048): acelera muchísimo el procesamiento del prompt en CPU
+    similarityThreshold: 0.7,
     noContextToken: 'SIN_CONTEXTO',
     nothingToken: 'NADA',
 
     // -- Carril de preguntas --
     questions: {
-        minNewChars: 70,         // Texto nuevo mínimo para volver a evaluar
-        maxNewChars: 1800,       // Máximo de texto "nuevo" enviado al modelo
-        recentContextChars: 1500,// Cola de contexto ya revisado, solo como referencia
-        maxHistory: 15,          // Preguntas previas que se le recuerdan al modelo
-        numPredict: 260,
+        minNewChars: 70,
+        maxNewChars: 1200,       // Reducido (antes 1800): envía menos texto nuevo a la vez
+        recentContextChars: 800, // Reducido (antes 1500): menos historial para procesar
+        maxHistory: 4,           // Reducido (antes 15): alivia fuertemente la carga cognitiva del modelo
+        numPredict: 200,         // Ajustado
         temperature: 0.3,
         minWords: 4,
         maxWords: 40,
@@ -47,23 +49,23 @@ const LLM_CONFIG = {
 
     // -- Carril de objeciones (el más sensible al tiempo) --
     objections: {
-        minChars: 20,            // Intervención mínima para evaluarla
-        earlyMinChars: 25,       // Mínimo para evaluar una pregunta aún en curso (parcial)
-        recentContextChars: 700,
-        maxTextChars: 700,
+        minChars: 20,
+        earlyMinChars: 25,
+        recentContextChars: 400, // Reducido (antes 700)
+        maxTextChars: 400,       // Reducido (antes 700)
         maxPerTurn: 2,
-        numPredict: 150,
+        numPredict: 100,
         temperature: 0.1
     },
 
     // -- Carril de contradicciones y datos clave --
     insights: {
         minNewChars: 90,
-        maxNewChars: 1500,
-        historyChars: 2500,      // Lo dicho antes, contra lo que se compara el texto nuevo
-        maxReported: 10,         // Hallazgos previos que se le recuerdan al modelo
-        maxPerTurn: 3,
-        numPredict: 150,
+        maxNewChars: 1000,       // Reducido (antes 1500)
+        historyChars: 1200,      // Reducido (antes 2500): crítico para evitar cuellos de botella en CPU
+        maxReported: 4,          // Reducido (antes 10)
+        maxPerTurn: 2,
+        numPredict: 120,
         temperature: 0.2
     }
 };
@@ -78,7 +80,7 @@ if (!JWT_SECRET || JWT_SECRET.length < 16) {
 
 const AUTH_CONFIG = {
     jwtExpiresIn: process.env.JWT_EXPIRES_IN || '8h',
-    bcryptRounds: 12,
+    bcryptRounds: 10,                                       // Optimizado (antes 12): 10 es seguro y reduce picos de CPU
     timezone: process.env.APP_TIMEZONE || 'America/Bogota', // Zona para evaluar el vencimiento
     loginMaxAttempts: 8,                                    // Intentos fallidos permitidos...
     loginWindowMs: 15 * 60 * 1000                           // ...dentro de esta ventana de tiempo
@@ -128,9 +130,6 @@ const DEFAULT_AUDIENCE_TYPE = 'penal';
 const JURISDICTION = process.env.APP_JURISDICTION || 'Colombia';
 
 // =================== Prompts base por tipo de audiencia ===================
-// -- Aquí solo vive lo que cambia según el tipo de juicio: el rol y el enfoque del asistente. --
-// -- Puedes detallar estos cuatro textos sin tocar nada más: el formato de salida que el sistema --
-// -- necesita se agrega aparte (ver INSTRUCCIONES_* más abajo), así no se rompe al editarlos. --
 const PROMPTS_POR_TIPO = {
     penal: `Eres un asistente de apoyo en tiempo real para un abogado que participa en una audiencia PENAL en ${JURISDICTION} (fiscalía, defensa, víctima, testigos, peritos y juez).
 Tu enfoque: los hechos y sus circunstancias de tiempo, modo y lugar; la fuente del conocimiento del testigo (si vio, oyó o le contaron); la coherencia y credibilidad de los testimonios; la identificación de personas y objetos; la cadena de custodia y las pruebas; la teoría del caso (tipicidad, antijuridicidad, culpabilidad) y las garantías procesales.`,
@@ -170,12 +169,12 @@ const INSTRUCCIONES_OBJECIONES = `Tu tarea: detectar, en la ÚLTIMA INTERVENCIÓ
 
 Tipos de objeción (usa exactamente el identificador):
 - capciosa: utiliza engaño, artificio o inducción a error para lograr que el testigo responda algo que no desea o que es falso.
-- sugestiva: sugiere o insinúa la respuesta dentro de la misma pregunta (ej.: "¿Es verdad que usted vio al acusado salir corriendo a las 8:00 PM?").
-- impertinente: no guarda relación con los hechos del debate ni con la teoría del caso; no aporta información útil para resolver el litigio.
+- sugestiva: sugiere o insinúa la respuesta dentro de la misma pregunta.
+- impertinente: no guarda relación con los hechos del debate ni con la teoría del caso.
 - ambigua: es tan imprecisa, confusa o vaga que el testigo no puede entender qué se le pregunta.
-- compuesta: contiene dos o más preguntas en una sola (ej.: "¿Dónde estaba usted a las 8:00 y qué llevaba puesto?").
-- repetitiva: insiste sobre un punto que ya fue respondido, sin aportar elementos nuevos (verifícalo con el CONTEXTO RECIENTE).
-- especulativa: pide al testigo suponer, imaginar o conjeturar sobre hechos que no le constan directamente.
+- compuesta: contiene dos o más preguntas en una sola.
+- repetitiva: insiste sobre un punto que ya fue respondido.
+- especulativa: pide al testigo suponer, imaginar o conjeturar sobre hechos que no le constan.
 
 Responde con una línea JSON por objeción (máximo ${LLM_CONFIG.objections.maxPerTurn}), sin markdown ni texto adicional:
 {"t":"<identificador>","cita":"<la pregunta tal como se transcribió, máximo 25 palabras>","motivo":"<por qué procede, máximo 14 palabras>"}
@@ -185,23 +184,22 @@ Reglas:
 2. Si la intervención no contiene ninguna pregunta objetable, responde exactamente: ${LLM_CONFIG.nothingToken}
 3. Un error de transcripción no es motivo de objeción.`;
 
-const INSTRUCCIONES_HALLAZGOS = `Tu tarea: revisar el TEXTO NUEVO, comparándolo con el HISTORIAL, para detectar dos cosas:
-- contradiccion: el texto nuevo contradice o es inconsistente con algo dicho antes (por la misma persona o entre declarantes) en hechos, fechas, horas, lugares, cantidades o versiones.
-- dato: un dato importante para el caso que el abogado debe tener presente (fecha, hora, lugar, persona, cantidad, documento, objeto o relación entre personas).
+const INSTRUCCIONES_HALLAZGOS = `Tu tarea: revisar el TEXTO NUEVO, comparándolo con el HISTORIAL, para detectar:
+- contradiccion: el texto nuevo contradice o es inconsistente con algo dicho antes.
+- dato: un dato importante para el caso que el abogado debe tener presente.
 
 Responde con una línea JSON por hallazgo (máximo ${LLM_CONFIG.insights.maxPerTurn}), sin markdown ni texto adicional:
-{"k":"contradiccion","titulo":"<máximo 6 palabras>","antes":"<lo dicho antes, máximo 20 palabras>","ahora":"<lo dicho ahora, máximo 20 palabras>","detalle":"<por qué se contradicen, máximo 20 palabras>"}
+{"k":"contradiccion","titulo":"<máximo 6 palabras>","antes":"<lo dicho antes>","ahora":"<lo dicho ahora>","detalle":"<por qué se contradicen, máximo 20 palabras>"}
 {"k":"dato","titulo":"<tipo de dato, máximo 4 palabras>","detalle":"<el dato concreto, máximo 20 palabras>"}
 
 Reglas:
-1. Reporta contradicciones solo si son reales. Una diferencia causada por un posible error de transcripción NO es una contradicción.
+1. Reporta contradicciones solo si son reales. Una diferencia por posible error de transcripción NO es contradicción.
 2. Reporta únicamente datos relevantes para el caso; ignora saludos, trámites y frases sin contenido.
 3. No repitas los HALLAZGOS YA REPORTADOS.
 4. Si no hay nada que reportar, responde exactamente: ${LLM_CONFIG.nothingToken}`;
 
 /**
- * Arma el prompt de sistema de cada carril: rol del tipo de audiencia + nota de
- * transcripción + formato del carril.
+ * Arma el prompt de sistema de cada carril
  */
 const buildSystemPrompts = (tipo) => {
     const domain = PROMPTS_POR_TIPO[tipo] || PROMPTS_POR_TIPO[DEFAULT_AUDIENCE_TYPE];
@@ -245,7 +243,7 @@ const buildInsightsPrompt = ({ caseName, caseDescription, history, reported, new
         `TEXTO NUEVO: ${newText}`
     ].filter(Boolean).join('\n');
 
-// -- Ejemplos (few-shot) por carril: fijan el formato y son neutros respecto al tipo de audiencia --
+// -- Ejemplos (few-shot) por carril --
 const EXAMPLE_CASE = 'Caso de ejemplo';
 
 const QUESTIONS_FEW_SHOT = [
@@ -305,22 +303,6 @@ const OBJECTIONS_FEW_SHOT = [
             cita: '¿Es cierto que usted vio al señor salir corriendo de la tienda a las nueve de la noche con la caja en la mano?',
             motivo: 'La pregunta ya trae incluida la respuesta que se espera.'
         })
-    },
-    {
-        role: 'user',
-        content: buildObjectionsPrompt({
-            caseName: EXAMPLE_CASE,
-            recentContext: '',
-            lastTurn: 'Dígame, ¿dónde estaba usted a las ocho y qué llevaba puesto ese día?'
-        })
-    },
-    {
-        role: 'assistant',
-        content: JSON.stringify({
-            t: 'compuesta',
-            cita: '¿Dónde estaba usted a las ocho y qué llevaba puesto ese día?',
-            motivo: 'Contiene dos preguntas distintas en una sola.'
-        })
     }
 ];
 
@@ -343,34 +325,7 @@ const INSIGHTS_FEW_SHOT = [
             ahora: 'Estaba en su casa desde las siete y se enteró al día siguiente.',
             detalle: 'Primero dice haberlo visto y luego dice que no estaba allí.'
         })
-    },
-    {
-        role: 'user',
-        content: buildInsightsPrompt({
-            caseName: EXAMPLE_CASE,
-            history: '',
-            reported: [],
-            newText: 'Le entregué un millón doscientos mil pesos en efectivo el quince de marzo en la oficina, sin recibo.'
-        })
-    },
-    {
-        role: 'assistant',
-        content: JSON.stringify({
-            k: 'dato',
-            titulo: 'Pago en efectivo',
-            detalle: '$1.200.000 entregados el 15 de marzo en la oficina, sin recibo.'
-        })
-    },
-    {
-        role: 'user',
-        content: buildInsightsPrompt({
-            caseName: EXAMPLE_CASE,
-            history: '',
-            reported: [],
-            newText: 'Sí, señoría, muchas gracias, entendido.'
-        })
-    },
-    { role: 'assistant', content: LLM_CONFIG.nothingToken }
+    }
 ];
 
 // =================== Utilidades del LLM ===================
@@ -385,16 +340,16 @@ const canon = (text = '') =>
         .replace(/\s+/g, ' ')
         .trim();
 
-/** Identificador en solo letras (para interpretar etiquetas que escribe el modelo). */
+/** Identificador en solo letras. */
 const normalizeKey = (value = '') => canon(value).replace(/[^a-z]/g, '');
 
-/** Recorta un texto a un máximo de caracteres, en una sola línea. */
+/** Recorta un texto a un máximo de caracteres. */
 const clip = (value, max) => {
     const text = String(value || '').replace(/\s+/g, ' ').trim();
     return text.length > max ? `${text.slice(0, max - 1).trim()}…` : text;
 };
 
-/** Conjunto de palabras relevantes de un texto. */
+/** Conjunto de palabras relevantes. */
 const toWordSet = (text) => new Set(canon(text).split(' ').filter((word) => word.length > 3));
 
 /** Similitud de Jaccard entre dos textos (0 a 1). */
@@ -413,7 +368,7 @@ const isDuplicateQuestion = (question, history, threshold = LLM_CONFIG.similarit
     history.some((previous) => similarity(question, previous) >= threshold);
 
 /**
- * Limpia un texto generado por el modelo y devuelve una pregunta válida o null.
+ * Limpia un texto generado por el modelo.
  */
 const cleanQuestion = (raw = '') => {
     const cfg = LLM_CONFIG.questions;
@@ -425,7 +380,6 @@ const cleanQuestion = (raw = '') => {
 
     if (!text || text.toUpperCase().includes(LLM_CONFIG.noContextToken)) return null;
 
-    // Primera línea que contenga una pregunta.
     const line = text.split('\n').map((l) => l.trim()).find((l) => l.includes('?'));
     if (!line) return null;
 
@@ -435,7 +389,6 @@ const cleanQuestion = (raw = '') => {
         .replace(/^["'“«]+/, '')
         .trim();
 
-    // Quedarse únicamente con la pregunta: desde el primer "¿" hasta el primer "?".
     const start = text.indexOf('¿');
     if (start > 0) text = text.slice(start);
 
@@ -450,48 +403,19 @@ const cleanQuestion = (raw = '') => {
     return text;
 };
 
-// -- Objeciones: texto que se muestra y frase lista para decir en la audiencia --
 const OBJECTION_TYPES = {
-    capciosa: {
-        label: 'Pregunta capciosa',
-        say: 'Objeción, señoría: la pregunta es capciosa, induce al testigo a error.',
-        note: null
-    },
-    sugestiva: {
-        label: 'Pregunta sugestiva',
-        say: 'Objeción, señoría: la pregunta es sugestiva, insinúa la respuesta.',
-        note: 'Procede en el interrogatorio directo; en el contrainterrogatorio está permitida.'
-    },
-    impertinente: {
-        label: 'Pregunta impertinente o irrelevante',
-        say: 'Objeción, señoría: la pregunta es impertinente, no guarda relación con los hechos del debate.',
-        note: null
-    },
-    ambigua: {
-        label: 'Pregunta ambigua, confusa o vaga',
-        say: 'Objeción, señoría: la pregunta es ambigua y confusa; solicito que se formule con claridad.',
-        note: null
-    },
-    compuesta: {
-        label: 'Pregunta compuesta',
-        say: 'Objeción, señoría: la pregunta es compuesta; solicito que se formule una a la vez.',
-        note: null
-    },
-    repetitiva: {
-        label: 'Pregunta repetitiva',
-        say: 'Objeción, señoría: la pregunta es repetitiva, ya fue respondida por el testigo.',
-        note: null
-    },
-    especulativa: {
-        label: 'Pregunta especulativa',
-        say: 'Objeción, señoría: la pregunta es especulativa, pide al testigo suponer sobre hechos que no le constan.',
-        note: null
-    }
+    capciosa: { label: 'Pregunta capciosa', say: 'Objeción, señoría: la pregunta es capciosa, induce al testigo a error.', note: null },
+    sugestiva: { label: 'Pregunta sugestiva', say: 'Objeción, señoría: la pregunta es sugestiva, insinúa la respuesta.', note: 'Procede en el interrogatorio directo; en el contrainterrogatorio está permitida.' },
+    impertinente: { label: 'Pregunta impertinente o irrelevante', say: 'Objeción, señoría: la pregunta es impertinente, no guarda relación con los hechos del debate.', note: null },
+    ambigua: { label: 'Pregunta ambigua, confusa o vaga', say: 'Objeción, señoría: la pregunta es ambigua y confusa; solicito que se formule con claridad.', note: null },
+    compuesta: { label: 'Pregunta compuesta', say: 'Objeción, señoría: la pregunta es compuesta; solicito que se formule una a la vez.', note: null },
+    repetitiva: { label: 'Pregunta repetitiva', say: 'Objeción, señoría: la pregunta es repetitiva, ya fue respondida por el testigo.', note: null },
+    especulativa: { label: 'Pregunta especulativa', say: 'Objeción, señoría: la pregunta es especulativa, pide al testigo suponer sobre hechos que no le constan.', note: null }
 };
 
 const QUESTION_CATEGORIES = ['aclarar', 'precisar', 'verificar', 'cuestionar', 'profundizar'];
 
-/** Convierte lo que devolvió el modelo en una pregunta con versiones alternativas. */
+/** Convierte lo que devolvió el modelo en una pregunta. */
 const parseQuestion = (obj, askedAll) => {
     const main = cleanQuestion(obj?.q);
     if (!main) return { status: 'invalid' };
@@ -587,7 +511,6 @@ const parseInsight = (obj) => {
     return null;
 };
 
-/** Indica si un hallazgo ya fue reportado (mismo tipo y texto muy parecido). */
 const isDuplicateAlert = (alert, history) =>
     history.some(
         (previous) =>
@@ -596,12 +519,30 @@ const isDuplicateAlert = (alert, history) =>
             similarity(previous.compareText, alert.compareText) >= 0.6
     );
 
+// =================== Gestor de concurrencia del LLM ===================
+// OPTIMIZACIÓN: Para un equipo de 2 núcleos y memoria limitada, lanzar múltiples
+// inferencias de LLM en paralelo genera saturación (thrashing) y caídas de CPU.
+// Se implementa un Mutex global para procesar cada petición secuencialmente, 
+// lo cual es radicalmente más rápido en entornos constreñidos.
+const llmMutex = {
+    current: Promise.resolve(),
+    lock() {
+        let release;
+        const next = new Promise(resolve => { release = resolve; });
+        const wait = this.current;
+        this.current = wait.then(() => next, () => next); // Continuar incluso si la anterior falla
+        return { wait, release };
+    }
+};
+
 /**
- * Llama a Ollama en streaming. Cada objeto JSON completo que aparezca en la
- * respuesta se entrega a onObject apenas se genera (sin esperar al final).
- * Devuelve el texto completo generado.
+ * Llama a Ollama en streaming respetando el encolamiento secuencial.
  */
 const streamFromLLM = async ({ model = LLM_CONFIG.model, messages, numPredict, temperature = 0.2 }, onObject) => {
+    // 1. Esperar el turno en la cola (Mutex)
+    const { wait, release } = llmMutex.lock();
+    await wait;
+
     let stream = null;
     let timer;
     let timedOut = false;
@@ -613,13 +554,14 @@ const streamFromLLM = async ({ model = LLM_CONFIG.model, messages, numPredict, t
             reject(new Error('Tiempo de espera agotado en Ollama'));
         }, LLM_CONFIG.timeoutMs);
     });
-    timeout.catch(() => { }); // Evita un "unhandled rejection" si nadie la está esperando.
+    timeout.catch(() => { });
 
+    // 2. Realizar la llamada, explotando los 2 hilos disponibles (ya que es la única ejecutándose)
     const call = ollama.chat({
         model,
         messages,
         stream: true,
-        think: false,       // Sin "razonamiento": respuesta directa y mucho más rápida
+        think: false,
         keep_alive: LLM_CONFIG.keepAlive,
         options: {
             temperature,
@@ -627,7 +569,7 @@ const streamFromLLM = async ({ model = LLM_CONFIG.model, messages, numPredict, t
             repeat_penalty: 1.1,
             num_ctx: LLM_CONFIG.numCtx,
             num_predict: numPredict,
-            num_thread: 1,
+            num_thread: 2, // Optimización crítica: forzar exactamente 2 hilos para usar el CPU eficientemente
         }
     });
     call.catch(() => { });
@@ -645,7 +587,7 @@ const streamFromLLM = async ({ model = LLM_CONFIG.model, messages, numPredict, t
             full += chunk;
             buffer += chunk;
 
-            // Extrae los objetos JSON planos completos que haya en el búfer.
+            // Extrae objetos JSON conforme se generan
             let match;
             while ((match = /\{[^{}]*\}/.exec(buffer))) {
                 buffer = buffer.slice(match.index + match[0].length);
@@ -665,6 +607,7 @@ const streamFromLLM = async ({ model = LLM_CONFIG.model, messages, numPredict, t
         throw error;
     } finally {
         clearTimeout(timer);
+        release(); // 3. Liberar el bloqueo para la siguiente tarea en la cola
     }
 
     return full.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
@@ -673,31 +616,23 @@ const streamFromLLM = async ({ model = LLM_CONFIG.model, messages, numPredict, t
 // =================== Motor del asistente en vivo ===================
 /**
  * Un motor por conexión. Recibe la transcripción (parcial y final) y, en tres
- * carriles paralelos, genera: objeciones, contradicciones / datos clave y
- * preguntas sugeridas con versiones alternativas.
- *
- * @param {object}   options
- * @param {string}   options.tipo            penal | civil | laboral | administrativo
- * @param {string}   options.caseName        Nombre del caso.
- * @param {string}   options.caseDescription Descripción del caso.
- * @param {Function} options.onStatus        Callback ({ state, message }).
- * @param {Function} options.onQuestion      Callback async (question) que persiste y emite.
- * @param {Function} options.onAlert         Callback async (alert) que persiste y emite.
+ * carriles lógicos, genera: objeciones, contradicciones / datos clave y
+ * preguntas sugeridas. (Físicamente encolados por llmMutex).
  */
 const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQuestion, onAlert }) => {
     const prompts = buildSystemPrompts(tipo);
 
-    const segments = [];          // Todas las intervenciones finales, en orden
-    const askedMain = [];         // Preguntas principales ya sugeridas (se le recuerdan al modelo)
-    const askedAll = [];          // Principales + variantes (para evitar repetidos)
-    const reportedAlerts = [];    // Objeciones y hallazgos ya emitidos
+    const segments = [];
+    const askedMain = [];
+    const askedAll = [];
+    const reportedAlerts = [];
 
     let isActive = true;
 
     // -- Preguntas --
-    let questionCursor = 0;       // Índice de la primera intervención aún no "consumida"
-    let questionChars = 0;        // Texto nuevo desde la última evaluación
-    let questionOutcome = 'idle'; // idle | ready | no_context
+    let questionCursor = 0;
+    let questionChars = 0;
+    let questionOutcome = 'idle';
 
     // -- Contradicciones y datos --
     let insightCursor = 0;
@@ -706,7 +641,7 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
     // -- Objeciones --
     let lastObjectionText = '';
 
-    // -- Estado que se le muestra al abogado --
+    // -- Estado --
     let heavyInFlight = 0;
     let hasError = false;
     let lastStatusKey = '';
@@ -733,8 +668,8 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
     };
 
     /**
-     * Un carril ejecuta una tarea a la vez. Si llega otra solicitud mientras corre,
-     * se guarda solo la más reciente y se atiende al terminar.
+     * Un carril ejecuta una tarea a la vez. Las peticiones a LLM se enviarán
+     * al mutex central automáticamente.
      */
     const createLane = ({ name, heavy, canRun, execute }) => {
         let running = false;
@@ -867,7 +802,6 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
                 }
             );
 
-            // Lo ya revisado pasa al historial, haya o no hallazgos.
             if (isActive) insightCursor = snapshot;
         }
     });
@@ -882,7 +816,6 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
 
             questionChars = 0;
 
-            // Instantánea: el texto que llegue durante el análisis no se pierde.
             const snapshot = segments.length;
             const newText = segments.slice(questionCursor, snapshot).join(' ').slice(-cfg.maxNewChars);
             const recentContext = segments.slice(0, questionCursor).join(' ').slice(-cfg.recentContextChars);
@@ -936,11 +869,9 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
                 questionOutcome = 'ready';
                 questionCursor = snapshot;
             } else if (sawDuplicate) {
-                // Había algo para preguntar, pero ya se había sugerido.
                 questionOutcome = 'idle';
                 questionCursor = snapshot;
             } else {
-                // El texto se sigue acumulando para la siguiente evaluación.
                 questionOutcome = 'no_context';
                 console.log('[IA] Sin pregunta útil. Respuesta cruda:', JSON.stringify(raw));
             }
@@ -948,7 +879,6 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
     });
 
     return {
-        /** Agrega una intervención final de la transcripción. */
         addTranscript(text) {
             if (!isActive) return;
 
@@ -959,7 +889,6 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
             questionChars += clean.length;
             insightChars += clean.length;
 
-            // Objeciones: se evalúan siempre, salvo que ya se hayan evaluado con este mismo texto.
             const objectionCfg = LLM_CONFIG.objections;
 
             if (clean.length >= objectionCfg.minChars && canon(clean) !== canon(lastObjectionText)) {
@@ -971,10 +900,6 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
             void runQuestions();
         },
 
-        /**
-         * Recibe texto parcial (el turno aún no termina). Si ya suena a pregunta completa,
-         * se evalúa de inmediato para mostrar la objeción lo antes posible.
-         */
         addInterim(text) {
             if (!isActive) return;
 
@@ -988,7 +913,6 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
             void runObjections({ text: clean, contextEnd: segments.length });
         },
 
-        /** Detiene el motor (fin de sesión o desconexión). */
         stop() {
             isActive = false;
         }
@@ -997,12 +921,8 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
 
 // =================== Usuarios: utilidades ===================
 
-// -- Columnas públicas. El vencimiento se devuelve como texto YYYY-MM-DD para evitar desfases de zona horaria --
 const USER_COLUMNS = `id, nombre, correo, rol, to_char(vencimiento, 'YYYY-MM-DD') AS vencimiento, activo, created_at`;
 
-/**
- * Fecha de hoy (YYYY-MM-DD) en la zona horaria configurada.
- */
 const getToday = () =>
     new Intl.DateTimeFormat('en-CA', {
         timeZone: AUTH_CONFIG.timezone,
@@ -1011,18 +931,11 @@ const getToday = () =>
         day: '2-digit'
     }).format(new Date());
 
-/**
- * Un administrador nunca depende de suscripción. Un cliente la tiene vigente
- * hasta el final del día de su vencimiento.
- */
 const hasActiveSubscription = (user) => {
     if (user.rol === 'admin') return true;
     return Boolean(user.vencimiento) && user.vencimiento >= getToday();
 };
 
-/**
- * Convierte una fila de la BD en el objeto que se expone al frontend (nunca incluye el hash).
- */
 const toPublicUser = (row) => ({
     id: row.id,
     nombre: row.nombre,
@@ -1047,10 +960,6 @@ const findUserByEmail = async (correo) => {
     return result.rows[0] || null;
 };
 
-/**
- * Genera una contraseña aleatoria y segura (12 caracteres con mayúscula,
- * minúscula, número y símbolo) usando el generador criptográfico del sistema.
- */
 const generatePassword = (length = 12) => {
     const sets = [
         'ABCDEFGHJKLMNPQRSTUVWXYZ',
@@ -1060,14 +969,12 @@ const generatePassword = (length = 12) => {
     ];
     const all = sets.join('');
 
-    // Garantiza al menos un carácter de cada grupo.
     const chars = sets.map((set) => set[crypto.randomInt(set.length)]);
 
     while (chars.length < length) {
         chars.push(all[crypto.randomInt(all.length)]);
     }
 
-    // Mezcla Fisher-Yates para no dejar un patrón predecible.
     for (let i = chars.length - 1; i > 0; i--) {
         const j = crypto.randomInt(i + 1);
         [chars[i], chars[j]] = [chars[j], chars[i]];
@@ -1076,9 +983,6 @@ const generatePassword = (length = 12) => {
     return chars.join('');
 };
 
-/**
- * Valida y normaliza los datos de un cliente (crear / editar).
- */
 const validateUserPayload = (body = {}) => {
     const nombre = String(body.nombre || '').trim();
     const correo = String(body.correo || '').trim().toLowerCase();
@@ -1093,7 +997,6 @@ const validateUserPayload = (body = {}) => {
         throw new AppError('Ingresa un correo válido.');
     }
 
-    // Formato YYYY-MM-DD y fecha real (descarta, por ejemplo, 2026-02-31).
     const parsed = new Date(`${vencimiento}T00:00:00Z`);
     if (
         !/^\d{4}-\d{2}-\d{2}$/.test(vencimiento) ||
@@ -1120,10 +1023,6 @@ const signToken = (user) =>
         expiresIn: AUTH_CONFIG.jwtExpiresIn
     });
 
-/**
- * Valida un token y devuelve el usuario ACTUAL de la BD (así, desactivar a un
- * cliente surte efecto de inmediato). Devuelve null si el token no es válido.
- */
 const getUserFromToken = async (token) => {
     if (!token) return null;
 
@@ -1138,7 +1037,6 @@ const getUserFromToken = async (token) => {
     return user && user.activo ? user : null;
 };
 
-/** Exige un token válido y deja el usuario en req.user. */
 const authenticate = async (req, res, next) => {
     try {
         const header = req.headers.authorization || '';
@@ -1156,7 +1054,6 @@ const authenticate = async (req, res, next) => {
     }
 };
 
-/** Solo administradores. */
 const requireAdmin = (req, res, next) => {
     if (req.user?.rol !== 'admin') {
         return res.status(403).json({ error: 'No tienes permisos para esta acción.' });
@@ -1164,7 +1061,6 @@ const requireAdmin = (req, res, next) => {
     next();
 };
 
-/** Solo clientes con suscripción vigente (los administradores siempre pasan). */
 const requireActiveSubscription = (req, res, next) => {
     if (!hasActiveSubscription(req.user)) {
         return res.status(403).json({
@@ -1174,7 +1070,6 @@ const requireActiveSubscription = (req, res, next) => {
     next();
 };
 
-// -- Límite de intentos de login (en memoria; suficiente para un login básico) --
 const loginAttempts = new Map();
 
 const isLoginBlocked = (key) => {
@@ -1199,7 +1094,6 @@ const registerFailedLogin = (key) => {
     }
 };
 
-// Limpieza periódica para que el mapa no crezca indefinidamente.
 setInterval(() => {
     const now = Date.now();
     for (const [key, entry] of loginAttempts) {
@@ -1209,7 +1103,6 @@ setInterval(() => {
 
 // =================== Base de datos: esquema y administrador inicial ===================
 const initializeDatabase = async () => {
-    // -- Tabla de usuarios --
     await pool.query(`
         CREATE TABLE IF NOT EXISTS users (
             id            SERIAL PRIMARY KEY,
@@ -1223,29 +1116,23 @@ const initializeDatabase = async () => {
         )
     `);
 
-    // -- El correo es único sin importar mayúsculas --
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_correo_unique ON users (LOWER(correo))`);
 
-    // -- Cada audiencia pertenece al usuario que la creó --
     await pool.query(`
         ALTER TABLE sessions
         ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id) ON DELETE SET NULL
     `);
 
-    // -- Tipo de audiencia (penal, civil, laboral o administrativo). Las audiencias anteriores quedan como "penal" --
     await pool.query(`
         ALTER TABLE sessions
         ADD COLUMN IF NOT EXISTS tipo VARCHAR(20) NOT NULL DEFAULT 'penal'
         CHECK (tipo IN ('penal', 'civil', 'laboral', 'administrativo'))
     `);
 
-    // -- Preguntas: versiones alternativas, enfoque y motivo --
     await pool.query(`ALTER TABLE ai_questions ADD COLUMN IF NOT EXISTS variants JSONB NOT NULL DEFAULT '[]'::jsonb`);
     await pool.query(`ALTER TABLE ai_questions ADD COLUMN IF NOT EXISTS category VARCHAR(30)`);
     await pool.query(`ALTER TABLE ai_questions ADD COLUMN IF NOT EXISTS reason TEXT`);
 
-    // -- Alertas del asistente: objeciones, contradicciones y datos clave --
-    // El tipo de session_id se toma de sessions.id para que la llave foránea siempre sea compatible.
     const sessionIdTypeResult = await pool.query(
         `SELECT format_type(atttypid, atttypmod) AS type
          FROM pg_attribute
@@ -1270,7 +1157,6 @@ const initializeDatabase = async () => {
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS ai_alerts_session_idx ON ai_alerts (session_id, created_at)`);
 
-    // -- Administrador inicial --
     const existingAdmin = await pool.query(`SELECT 1 FROM users WHERE rol = 'admin' LIMIT 1`);
 
     if (existingAdmin.rows.length === 0) {
@@ -1299,7 +1185,6 @@ app.use(cors({ origin: process.env.CLIENT_ORIGIN || '*' }));
 app.use(express.json({ limit: '100kb' }));
 
 // =================== 2. RUTAS PÚBLICAS: AUTENTICACIÓN ===================
-// -- 2.1 Iniciar sesión --
 app.post('/api/auth/login', async (req, res) => {
     try {
         const correo = String(req.body?.correo || '').trim().toLowerCase();
@@ -1316,8 +1201,6 @@ app.post('/api/auth/login', async (req, res) => {
         }
 
         const user = await findUserByEmail(correo);
-
-        // Siempre se compara contra un hash para que el tiempo no revele si el correo existe.
         const passwordMatches = await bcrypt.compare(password, user?.password_hash || DUMMY_HASH);
 
         if (!user || !passwordMatches) {
@@ -1341,13 +1224,11 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-// -- 2.2 Datos del usuario autenticado (para restaurar la sesión al recargar) --
 app.get('/api/auth/me', authenticate, (req, res) => {
     res.status(200).json({ user: toPublicUser(req.user) });
 });
 
 // =================== 3. RUTAS PROTEGIDAS: USUARIOS (SOLO ADMIN) ===================
-// -- 3.1 Listar clientes con búsqueda y paginación --
 app.get('/api/users', authenticate, requireAdmin, async (req, res) => {
     try {
         const page = Math.max(1, parseInt(req.query.page, 10) || 1);
@@ -1384,7 +1265,6 @@ app.get('/api/users', authenticate, requireAdmin, async (req, res) => {
     }
 });
 
-// -- 3.2 Crear un cliente (la contraseña se genera automáticamente) --
 app.post('/api/users', authenticate, requireAdmin, async (req, res) => {
     try {
         const { nombre, correo, vencimiento, activo } = validateUserPayload(req.body);
@@ -1399,7 +1279,6 @@ app.post('/api/users', authenticate, requireAdmin, async (req, res) => {
             [nombre, correo, hash, vencimiento, activo]
         );
 
-        // La contraseña en texto plano solo se devuelve en esta respuesta.
         res.status(201).json({
             user: toPublicUser(result.rows[0]),
             temporaryPassword
@@ -1410,7 +1289,6 @@ app.post('/api/users', authenticate, requireAdmin, async (req, res) => {
     }
 });
 
-// -- 3.3 Editar un cliente --
 app.put('/api/users/:id', authenticate, requireAdmin, async (req, res) => {
     try {
         const id = parseId(req.params.id);
@@ -1433,7 +1311,6 @@ app.put('/api/users/:id', authenticate, requireAdmin, async (req, res) => {
     }
 });
 
-// -- 3.4 Activar o desactivar un cliente --
 app.patch('/api/users/:id/status', authenticate, requireAdmin, async (req, res) => {
     try {
         const id = parseId(req.params.id);
@@ -1458,7 +1335,6 @@ app.patch('/api/users/:id/status', authenticate, requireAdmin, async (req, res) 
     }
 });
 
-// -- 3.5 Generar una nueva contraseña para un cliente --
 app.post('/api/users/:id/reset-password', authenticate, requireAdmin, async (req, res) => {
     try {
         const id = parseId(req.params.id);
@@ -1486,7 +1362,6 @@ app.post('/api/users/:id/reset-password', authenticate, requireAdmin, async (req
 });
 
 // =================== 4. RUTAS PROTEGIDAS: AUDIENCIAS ===================
-// -- 4.1 Listar audiencias (el cliente ve las suyas; el admin ve todas) --
 app.get('/api/sessions', authenticate, async (req, res) => {
     try {
         const page = Math.max(1, parseInt(req.query.page, 10) || 1);
@@ -1534,7 +1409,6 @@ app.get('/api/sessions', authenticate, async (req, res) => {
     }
 });
 
-// -- 4.2 Crear una audiencia (requiere suscripción vigente) --
 app.post('/api/sessions', authenticate, requireActiveSubscription, async (req, res) => {
     try {
         const { case_name, case_description } = req.body;
@@ -1566,7 +1440,6 @@ app.post('/api/sessions', authenticate, requireActiveSubscription, async (req, r
     }
 });
 
-// -- 4.3 Detalle de una audiencia --
 app.get('/api/sessions/:id', authenticate, async (req, res) => {
     try {
         const { id } = req.params;
@@ -1582,7 +1455,6 @@ app.get('/api/sessions/:id', authenticate, async (req, res) => {
 
         const session = sessionResult.rows[0];
 
-        // Para un cliente ajeno se responde "no existe" y no "prohibido", para no revelar datos.
         if (!session || (req.user.rol !== 'admin' && session.user_id !== req.user.id)) {
             throw new AppError('La audiencia solicitada no existe.', 404);
         }
@@ -1628,7 +1500,6 @@ app.get('/api/sessions/:id', authenticate, async (req, res) => {
     }
 });
 
-// -- 4.4 Verificar que Ollama y el modelo respondan (solo admin) --
 app.get('/api/llm/health', authenticate, requireAdmin, async (req, res) => {
     const start = Date.now();
 
@@ -1662,7 +1533,6 @@ const io = new Server(server, {
     }
 });
 
-// -- Solo se aceptan conexiones con un token válido --
 io.use(async (socket, next) => {
     try {
         const user = await getUserFromToken(socket.handshake.auth?.token);
@@ -1681,7 +1551,6 @@ io.use(async (socket, next) => {
 io.on('connection', (socket) => {
     console.log(`[BACKEND] Socket conectado (ID: ${socket.id}, usuario: ${socket.data.userId})`);
 
-    // -- Estado propio de cada conexión --
     let deepgramLive = null;
     let currentSessionId = null;
     let isConnecting = false;
@@ -1689,9 +1558,6 @@ io.on('connection', (socket) => {
     let assistantEngine = null;
     let transcriptionQueue = Promise.resolve();
 
-    /**
-     * Guarda una transcripción en orden, sin bloquear la recepción de nuevas.
-     */
     const saveTranscription = (text) => {
         const sessionId = currentSessionId;
 
@@ -1709,9 +1575,6 @@ io.on('connection', (socket) => {
         return transcriptionQueue;
     };
 
-    /**
-     * Guarda una pregunta generada (con sus versiones) y la envía a todos los clientes de la sesión.
-     */
     const saveAndEmitQuestion = async ({ question, variants, category, reason }) => {
         const result = await pool.query(
             `INSERT INTO ai_questions (session_id, question, variants, category, reason)
@@ -1723,9 +1586,6 @@ io.on('connection', (socket) => {
         io.to(currentSessionId).emit('new_question', result.rows[0]);
     };
 
-    /**
-     * Guarda una objeción, contradicción o dato clave y lo envía a todos los clientes de la sesión.
-     */
     const saveAndEmitAlert = async (alert) => {
         const result = await pool.query(
             `INSERT INTO ai_alerts (session_id, kind, subtype, title, quote, quote_prev, detail, say, note)
@@ -1747,9 +1607,6 @@ io.on('connection', (socket) => {
         io.to(currentSessionId).emit('new_alert', result.rows[0]);
     };
 
-    /**
-     * Detiene el motor del asistente.
-     */
     const releaseResources = () => {
         if (assistantEngine) {
             assistantEngine.stop();
@@ -1757,14 +1614,12 @@ io.on('connection', (socket) => {
         }
     };
 
-    // -- Iniciar sesión: valida permisos, abre Deepgram y prepara el motor de preguntas --
     socket.on('join_session', async (sessionId) => {
         if (isConnecting || deepgramLive) return;
 
         isConnecting = true;
 
         try {
-            // 1. Revalidar usuario y suscripción con datos frescos de la BD.
             const user = await findUserById(socket.data.userId);
 
             if (!user || !user.activo) {
@@ -1775,7 +1630,6 @@ io.on('connection', (socket) => {
                 throw new AppError('Tu suscripción no está vigente. Contacta al administrador.', 403);
             }
 
-            // 2. Verificar que la audiencia exista y pertenezca al usuario.
             const caseResult = await pool.query(
                 'SELECT case_name, case_description, tipo, user_id FROM sessions WHERE id = $1',
                 [sessionId]
@@ -1790,7 +1644,6 @@ io.on('connection', (socket) => {
             socket.join(currentSessionId);
             console.log(`[BACKEND] Transmitiendo audio para la sesión: ${currentSessionId}`);
 
-            // 3. Motor del asistente con el contexto del caso y el prompt según el tipo de audiencia.
             assistantEngine = createAssistantEngine({
                 tipo: caseInfo.tipo,
                 caseName: caseInfo.case_name,
@@ -1800,7 +1653,6 @@ io.on('connection', (socket) => {
                 onAlert: saveAndEmitAlert
             });
 
-            // 4. Deepgram SDK v5 - Flux
             deepgramLive = await deepgram.listen.v2.connect({
                 model: 'flux-general-multi',
                 language_hint: 'es'
@@ -1810,9 +1662,7 @@ io.on('connection', (socket) => {
                 console.log('[BACKEND] Conexión abierta con Deepgram');
             });
 
-            // -- Recibir transcripciones --
             deepgramLive.on('message', (data) => {
-                // Deepgram confirmó que está listo para recibir audio.
                 if (data.type === 'Connected') {
                     console.log('[BACKEND] Deepgram listo para recibir audio.');
                     socket.emit('session_ready', { message: 'Motor de transcripción listo' });
@@ -1827,14 +1677,11 @@ io.on('connection', (socket) => {
 
                 const isFinal = data.event === 'EndOfTurn';
 
-                // Enviar la transcripción (parcial o final) a React.
                 io.to(currentSessionId).emit('new_transcription', {
                     text: transcript,
                     isFinal
                 });
 
-                // Las intervenciones definitivas se guardan y alimentan al asistente.
-                // El texto parcial solo sirve para detectar objeciones lo antes posible.
                 if (isFinal) {
                     saveTranscription(transcript);
                     assistantEngine?.addTranscript(transcript);
@@ -1884,7 +1731,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // -- Recibir audio desde React --
     socket.on('audio_chunk', ({ sessionId, data } = {}) => {
         try {
             if (!deepgramLive || deepgramLive.readyState !== 1) return;
@@ -1912,7 +1758,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // -- Finalizar transmisión --
     socket.on('stop_session', () => {
         if (!deepgramLive || isStopping) return;
 
@@ -1920,7 +1765,6 @@ io.on('connection', (socket) => {
             isStopping = true;
             console.log(`[BACKEND] Finalizando sesión ${currentSessionId}`);
 
-            // Se pide el cierre a Deepgram; el motor se detiene cuando llegue el evento "close".
             deepgramLive.sendCloseStream({ type: 'CloseStream' });
 
         } catch (error) {
@@ -1933,7 +1777,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // -- Desconexión del cliente --
     socket.on('disconnect', () => {
         console.log(`[BACKEND] Socket desconectado: ${socket.id}`);
 
