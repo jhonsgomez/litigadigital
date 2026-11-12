@@ -27,7 +27,7 @@ const LLM_CONFIG = {
     fastModel: process.env.OLLAMA_FAST_MODEL || process.env.OLLAMA_MODEL || 'qwen3.5:4b',
     timeoutMs: 45000,            // Tiempo máximo de espera por respuesta del modelo
     keepAlive: '60m',            // Mantiene el modelo cargado en memoria
-    numCtx: 4096,                // Igual en todas las llamadas (ver nota arriba)
+    numCtx: 2048,                // Igual en todas las llamadas (ver nota arriba)
     similarityThreshold: 0.7,    // Similitud (Jaccard) a partir de la cual algo es duplicado
     noContextToken: 'SIN_CONTEXTO',
     nothingToken: 'NADA',
@@ -52,7 +52,7 @@ const LLM_CONFIG = {
         recentContextChars: 700,
         maxTextChars: 700,
         maxPerTurn: 2,
-        numPredict: 140,
+        numPredict: 150,
         temperature: 0.1
     },
 
@@ -63,7 +63,7 @@ const LLM_CONFIG = {
         historyChars: 2500,      // Lo dicho antes, contra lo que se compara el texto nuevo
         maxReported: 10,         // Hallazgos previos que se le recuerdan al modelo
         maxPerTurn: 3,
-        numPredict: 220,
+        numPredict: 150,
         temperature: 0.2
     }
 };
@@ -626,7 +626,8 @@ const streamFromLLM = async ({ model = LLM_CONFIG.model, messages, numPredict, t
             top_p: 0.9,
             repeat_penalty: 1.1,
             num_ctx: LLM_CONFIG.numCtx,
-            num_predict: numPredict
+            num_predict: numPredict,
+            num_thread: 1,
         }
     });
     call.catch(() => { });
