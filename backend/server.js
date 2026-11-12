@@ -19,29 +19,41 @@ const deepgram = new DeepgramClient({
     apiKey: process.env.DEEPGRAM_API_KEY
 });
 
-// =================== Configuración del LLM (Ollama) ===================
-const ollama = require('./config/ollama');
+// =================== Configuración del LLM (Groq) ===================
+const Groq = require('groq-sdk');
+if (!process.env.GROQ_API_KEY) {
+    console.error('[BACKEND] Define GROQ_API_KEY en el .env antes de iniciar.');
+    process.exit(1);
+}
 
-// OPTIMIZACIÓN: Ajustes para modelos básicos en hardware limitado.
-// Se eliminaron las ventanas de contexto previo (recentContext) para forzar al modelo 
-// a enfocarse 100% en el texto nuevo, evitando que recicle temas pasados.
+const groq = new Groq({
+    apiKey: process.env.GROQ_API_KEY,
+    maxRetries: 1 // reintentos automáticos del SDK solo para errores de red / 429 / 5xx
+});
+
 const LLM_CONFIG = {
-    model: process.env.OLLAMA_MODEL || 'qwen3:0.6b',
-    fastModel: process.env.OLLAMA_FAST_MODEL || process.env.OLLAMA_MODEL || 'qwen3:0.6b',
-    timeoutMs: 60000,
-    keepAlive: '15m',
-    numCtx: 1024,
+    // Modelos de Groq. Ambos son modelos de RAZONAMIENTO (gpt-oss): parte del presupuesto
+    // de tokens se gasta "pensando" antes de escribir la respuesta.
+    model: 'openai/gpt-oss-120b',     // Razonamiento profundo
+    fastModel: 'openai/gpt-oss-20b',  // Respuestas rápidas
+    timeoutMs: 20000,
     similarityThreshold: 0.7,
     noContextToken: 'SIN_CONTEXTO',
     nothingToken: 'NADA',
 
+    // Esfuerzo de razonamiento: 'low' deja casi todo el presupuesto para el JSON final.
+    reasoningEffort: 'low',
+
     // -- Carril de preguntas --
+    // IMPORTANTE: maxTokens incluye los tokens de razonamiento. Con 150-250 el modelo se quedaba
+    // sin tokens antes de escribir el JSON (finish_reason = "length") y Groq respondía
+    // json_validate_failed con failed_generation vacío. Por eso se subieron los límites.
     questions: {
         minNewChars: 70,
         maxNewChars: 1200,
         maxHistory: 4,           // Solo recuerda las últimas 4 preguntas para no repetirlas
-        numPredict: 200,
-        temperature: 0.3,
+        maxTokens: 1500,
+        temperature: 0.2,
         minWords: 4,
         maxWords: 40,
         maxChars: 300
@@ -53,7 +65,7 @@ const LLM_CONFIG = {
         earlyMinChars: 25,
         maxTextChars: 400,
         maxPerTurn: 2,
-        numPredict: 100,
+        maxTokens: 1000,
         temperature: 0.1
     },
 
@@ -61,10 +73,10 @@ const LLM_CONFIG = {
     insights: {
         minNewChars: 90,
         maxNewChars: 1000,
-        historyChars: 1200,      // Este es el único carril que mantiene historial (para buscar contradicciones)
+        historyChars: 1200,      // Este carril sí mantiene historial para buscar contradicciones
         maxReported: 4,
         maxPerTurn: 2,
-        numPredict: 120,
+        maxTokens: 1500,
         temperature: 0.2
     }
 };
@@ -85,7 +97,6 @@ const AUTH_CONFIG = {
     loginWindowMs: 15 * 60 * 1000
 };
 
-// -- Administrador inicial --
 const DEFAULT_ADMIN = {
     nombre: process.env.ADMIN_NAME || 'Administrador',
     correo: (process.env.ADMIN_EMAIL || 'admin@asistente.com').toLowerCase(),
@@ -118,7 +129,7 @@ const AUDIENCE_TYPES = ['penal', 'civil', 'laboral', 'administrativo'];
 const DEFAULT_AUDIENCE_TYPE = 'penal';
 const JURISDICTION = process.env.APP_JURISDICTION || 'Colombia';
 
-// =================== Prompts base por tipo de audiencia ===================
+// =================== Prompts base ===================
 const PROMPTS_POR_TIPO = {
     penal: `ÁREA PENAL (Ley 906 de 2004, sistema penal acusatorio colombiano).
 - El contrainterrogatorio solo puede referirse a temas tratados en el interrogatorio directo. No propongas preguntas sobre temas nuevos.
@@ -159,56 +170,47 @@ const INSTRUCCIONES_PREGUNTAS = `Eres un asistente de apoyo experto para un abog
 Tu tarea: proponer UNA pregunta estratégica que el abogado pueda formular a continuación, junto con dos versiones alternativas.
 
 Estrategia para construir la pregunta:
-- Usa preguntas cerradas, cortas y con un solo hecho por pregunta (que se respondan con sí/no o un dato concreto). Evita preguntas que permitan al declarante explicar o justificarse.
-- Fija bases para credibilidad: indaga cómo supo lo que dice (lo vio, lo oyó), dónde estaba, a qué distancia, a qué hora, con qué luz, por cuánto tiempo.
-- Confrontación: Si detectas una contradicción lógica o con lo dicho antes, formula la pregunta de manera que el declarante quede acorralado y solo pueda confirmar el hecho que lo contradice.
-- NUNCA preguntes "por qué" ni pidas opiniones (salvo a un perito sobre su método).
-- Evita preguntas impertinentes, superfluas, repetidas, o capciosas. No hagas preguntas que puedan favorecer a la contraparte.
+- Usa preguntas cerradas, cortas y con un solo hecho por pregunta. Evita preguntas que permitan al declarante explicar o justificarse.
+- Fija bases para credibilidad o acorrala con contradicciones.
+- NUNCA preguntes "por qué" ni pidas opiniones.
 
-Responde con UNA sola línea JSON, sin markdown ni texto adicional:
-{"q":"<mejor versión cerrada y precisa>","directa":"<versión más directa>","abierta":"<versión alternativa>","enfoque":"<aclarar|precisar|verificar|cuestionar|profundizar>","porque":"<motivo estratégico en máximo 12 palabras>"}
+Responde ÚNICAMENTE con un objeto JSON válido con esta estructura exacta:
+{"q":"<mejor versión cerrada>","directa":"<versión más directa>","abierta":"<versión alternativa>","enfoque":"<aclarar|precisar|verificar|cuestionar|profundizar>","porque":"<motivo estratégico en máximo 12 palabras>"}
 
 Reglas estrictas de JSON:
-1. Cada pregunta va en español, entre signos de interrogación, y es UNA sola pregunta. Máximo ${LLM_CONFIG.questions.maxWords} palabras.
-2. Basa las preguntas ESTRICTAMENTE en los hechos presentes en el TEXTO NUEVO. El CONTEXTO PREVIO es solo referencia.
-3. No repitas ni reformules ninguna de las PREGUNTAS YA SUGERIDAS.
-4. Si el TEXTO NUEVO solo tiene saludos, formalidades, intervenciones del juez o información inútil, responde exactamente: ${LLM_CONFIG.noContextToken}`;
+1. Máximo ${LLM_CONFIG.questions.maxWords} palabras por pregunta.
+2. Basa las preguntas ESTRICTAMENTE en el TEXTO NUEVO.
+3. No repitas PREGUNTAS YA SUGERIDAS.
+4. Si el TEXTO NUEVO es inútil (saludos, trámites), el JSON debe ser exactamente: {"q": "${LLM_CONFIG.noContextToken}"}`;
 
 const INSTRUCCIONES_OBJECIONES = `Tu tarea: detectar, en la ÚLTIMA INTERVENCIÓN, preguntas formuladas en voz alta que merezcan una objeción procesal. Solo evalúas preguntas hechas por la contraparte.
 
-Tipos de objeción a detectar (usa exactamente el identificador):
-- capciosa: utiliza engaño o inducción a error para que el testigo diga algo falso.
-- sugestiva: sugiere o insinúa la respuesta dentro de la pregunta (Nota: permitida en contrainterrogatorio, objeta si es evidente abuso).
-- impertinente: no guarda relación con los hechos del debate procesal.
-- ambigua: imprecisa, confusa o vaga.
-- compuesta: contiene dos o más hechos o preguntas en una sola.
-- repetitiva: insiste sobre un punto ya respondido.
-- especulativa: pide al testigo suponer, imaginar o opinar sobre hechos.
+Tipos de objeción a detectar (usa exactamente el identificador): capciosa, sugestiva, impertinente, ambigua, compuesta, repetitiva, especulativa.
 
-Responde con una línea JSON por objeción, sin markdown ni texto adicional:
-{"t":"<identificador>","cita":"<la pregunta tal como se transcribió, máximo 25 palabras>","motivo":"<por qué procede, máximo 14 palabras>"}
+Responde ÚNICAMENTE con un objeto JSON válido con esta estructura exacta:
+{"objeciones": [
+  {"t":"<identificador>","cita":"<la pregunta transcrita, máximo 25 palabras>","motivo":"<por qué procede, máximo 14 palabras>"}
+]}
 
 Reglas:
-1. Señala la objeción solo cuando sea muy clara. Ante la duda o si no hay preguntas objetables, responde exactamente: ${LLM_CONFIG.nothingToken}
+1. Señala la objeción solo cuando sea muy clara. Ante la duda o si no hay objeciones, devuelve un array vacío: {"objeciones": []}
 2. Un error de transcripción automático no es motivo de objeción.`;
 
-const INSTRUCCIONES_HALLAZGOS = `Tu tarea: revisar el TEXTO NUEVO, comparándolo con el HISTORIAL, para detectar alertas para el abogado:
-- contradiccion: el relato actual es inconsistente, ilógico o contradice algo dicho antes por la misma persona.
-- dato: un hecho clave revelado que el abogado debe anotar inmediatamente (cifras, nombres, horas exactas, confesiones).
+const INSTRUCCIONES_HALLAZGOS = `Tu tarea: revisar el TEXTO NUEVO, comparándolo con el HISTORIAL, para detectar alertas para el abogado: contradiccion o dato clave.
 
-Responde con una línea JSON por hallazgo, sin markdown ni texto adicional:
-{"k":"contradiccion","titulo":"<máximo 6 palabras>","antes":"<lo dicho antes, máximo 20 palabras>","ahora":"<lo dicho ahora, máximo 20 palabras>","detalle":"<por qué es contradictorio>"}
-{"k":"dato","titulo":"<tipo de dato, ej: Confesión de pago>","detalle":"<dato concreto, máximo 20 palabras>"}
+Responde ÚNICAMENTE con un objeto JSON válido con esta estructura exacta:
+{"hallazgos": [
+  {"k":"<contradiccion o dato>","titulo":"<máximo 6 palabras>","antes":"<lo dicho antes o vacío>","ahora":"<lo dicho ahora>","detalle":"<explicación breve>"}
+]}
 
 Reglas:
-1. Reporta contradicciones solo si son evidentes y reales, no asumas cosas.
-2. Ignora saludos, trámites del juez y frases sin contenido probatorio.
-3. Si no hay nada útil que reportar, responde exactamente: ${LLM_CONFIG.nothingToken}`;
+1. Reporta contradicciones solo si son evidentes y reales.
+2. Ignora saludos o frases sin contenido probatorio.
+3. Si no hay nada útil que reportar, devuelve un array vacío: {"hallazgos": []}`;
+
 
 const buildSystemPrompts = (tipo) => {
     const domain = PROMPTS_POR_TIPO[tipo] || PROMPTS_POR_TIPO[DEFAULT_AUDIENCE_TYPE];
-
-    // Ensamblaje perfecto: combina la instrucción base + el área legal + la nota de transcripción
     const compose = (instructions) => `${instructions}\n\n${domain}\n\n${TRANSCRIPTION_NOTES}`;
 
     return {
@@ -224,7 +226,6 @@ const caseHeader = (caseName, caseDescription) => [
     caseDescription ? `DESCRIPCIÓN: ${String(caseDescription).slice(0, 600)}` : null
 ];
 
-// Eliminado el "CONTEXTO PREVIO" para aislar el modelo estrictamente en el bloque de audio recién dicho.
 const buildQuestionsPrompt = ({ caseName, caseDescription, askedQuestions, newText }) =>
     [
         ...caseHeader(caseName, caseDescription),
@@ -233,7 +234,6 @@ const buildQuestionsPrompt = ({ caseName, caseDescription, askedQuestions, newTe
         `TEXTO NUEVO: ${newText}`
     ].filter(Boolean).join('\n');
 
-// Eliminado el "CONTEXTO RECIENTE" para objeciones. Evalúa puramente lo que acaba de escuchar.
 const buildObjectionsPrompt = ({ caseName, caseDescription, lastTurn }) =>
     [
         ...caseHeader(caseName, caseDescription),
@@ -250,7 +250,7 @@ const buildInsightsPrompt = ({ caseName, caseDescription, history, reported, new
     ].filter(Boolean).join('\n');
 
 
-// =================== Ejemplos (few-shot) actualizados sin contexto ===================
+// =================== Ejemplos (few-shot) adaptados para JSON estructurado ===================
 const EXAMPLE_CASE = 'Caso de ejemplo';
 
 const QUESTIONS_FEW_SHOT = [
@@ -262,7 +262,7 @@ const QUESTIONS_FEW_SHOT = [
             newText: 'Buenos días, señoría. Me presento, soy el testigo, vivo en el barrio San José y fui citado para declarar en esta audiencia.'
         })
     },
-    { role: 'assistant', content: LLM_CONFIG.noContextToken },
+    { role: 'assistant', content: `{"q": "${LLM_CONFIG.noContextToken}"}` },
     {
         role: 'user',
         content: buildQuestionsPrompt({
@@ -291,7 +291,7 @@ const OBJECTIONS_FEW_SHOT = [
             lastTurn: 'Buenos días, señor testigo. ¿Podría decirnos su nombre completo y a qué se dedica?'
         })
     },
-    { role: 'assistant', content: LLM_CONFIG.nothingToken },
+    { role: 'assistant', content: `{"objeciones": []}` },
     {
         role: 'user',
         content: buildObjectionsPrompt({
@@ -302,9 +302,11 @@ const OBJECTIONS_FEW_SHOT = [
     {
         role: 'assistant',
         content: JSON.stringify({
-            t: 'sugestiva',
-            cita: '¿Es cierto que usted vio al señor salir corriendo de la tienda a las nueve de la noche con la caja en la mano?',
-            motivo: 'La pregunta ya trae incluida la respuesta que se espera.'
+            objeciones: [{
+                t: 'sugestiva',
+                cita: '¿Es cierto que usted vio al señor salir corriendo de la tienda a las nueve de la noche con la caja en la mano?',
+                motivo: 'La pregunta ya trae incluida la respuesta que se espera.'
+            }]
         })
     }
 ];
@@ -322,11 +324,13 @@ const INSIGHTS_FEW_SHOT = [
     {
         role: 'assistant',
         content: JSON.stringify({
-            k: 'contradiccion',
-            titulo: 'Presencia en el lugar',
-            antes: 'Vio al señor salir de la tienda a las nueve de la noche.',
-            ahora: 'Estaba en su casa desde las siete y se enteró al día siguiente.',
-            detalle: 'Primero dice haberlo visto y luego dice que no estaba allí.'
+            hallazgos: [{
+                k: 'contradiccion',
+                titulo: 'Presencia en el lugar',
+                antes: 'Vio al señor salir de la tienda a las nueve de la noche.',
+                ahora: 'Estaba en su casa desde las siete y se enteró al día siguiente.',
+                detalle: 'Primero dice haberlo visto y luego dice que no estaba allí.'
+            }]
         })
     }
 ];
@@ -366,27 +370,14 @@ const isDuplicateQuestion = (question, history, threshold = LLM_CONFIG.similarit
 const cleanQuestion = (raw = '') => {
     const cfg = LLM_CONFIG.questions;
 
-    let text = String(raw)
-        .replace(/<think>[\s\S]*?<\/think>/gi, '')
-        .replace(/```/g, '')
-        .trim();
-
+    let text = String(raw).trim();
     if (!text || text.toUpperCase().includes(LLM_CONFIG.noContextToken)) return null;
-
-    const line = text.split('\n').map((l) => l.trim()).find((l) => l.includes('?'));
-    if (!line) return null;
-
-    text = line
-        .replace(/^(\d+[.)]|[-*•])\s*/, '')
-        .replace(/^pregunta\s*:\s*/i, '')
-        .replace(/^["'“«]+/, '')
-        .trim();
 
     const start = text.indexOf('¿');
     if (start > 0) text = text.slice(start);
 
     const end = text.indexOf('?');
-    text = text.slice(0, end + 1);
+    if (end > 0) text = text.slice(0, end + 1);
 
     if (!text.startsWith('¿')) text = `¿${text}`;
 
@@ -397,13 +388,13 @@ const cleanQuestion = (raw = '') => {
 };
 
 const OBJECTION_TYPES = {
-    capciosa: { label: 'Pregunta capciosa', say: 'Objeción: la pregunta es capciosa, induce al testigo a error.', note: null },
-    sugestiva: { label: 'Pregunta sugestiva', say: 'Objeción: la pregunta es sugestiva, insinúa la respuesta.', note: 'Procede en el interrogatorio directo; en el contrainterrogatorio está permitida.' },
-    impertinente: { label: 'Pregunta impertinente o irrelevante', say: 'Objeción: la pregunta es impertinente, no guarda relación con los hechos del debate.', note: null },
-    ambigua: { label: 'Pregunta ambigua, confusa o vaga', say: 'Objeción: la pregunta es ambigua y confusa; solicito que se formule con claridad.', note: null },
-    compuesta: { label: 'Pregunta compuesta', say: 'Objeción: la pregunta es compuesta; solicito que se formule una a la vez.', note: null },
-    repetitiva: { label: 'Pregunta repetitiva', say: 'Objeción: la pregunta es repetitiva, ya fue respondida por el testigo.', note: null },
-    especulativa: { label: 'Pregunta especulativa', say: 'Objeción: la pregunta es especulativa, pide al testigo suponer sobre hechos que no le constan.', note: null }
+    capciosa: { label: 'Pregunta capciosa', say: 'Objeción, señoría: la pregunta es capciosa, induce al testigo a error.', note: null },
+    sugestiva: { label: 'Pregunta sugestiva', say: 'Objeción, señoría: la pregunta es sugestiva, insinúa la respuesta.', note: 'Procede en el interrogatorio directo; en el contrainterrogatorio está permitida.' },
+    impertinente: { label: 'Pregunta impertinente o irrelevante', say: 'Objeción, señoría: la pregunta es impertinente, no guarda relación con los hechos del debate.', note: null },
+    ambigua: { label: 'Pregunta ambigua, confusa o vaga', say: 'Objeción, señoría: la pregunta es ambigua y confusa; solicito que se formule con claridad.', note: null },
+    compuesta: { label: 'Pregunta compuesta', say: 'Objeción, señoría: la pregunta es compuesta; solicito que se formule una a la vez.', note: null },
+    repetitiva: { label: 'Pregunta repetitiva', say: 'Objeción, señoría: la pregunta es repetitiva, ya fue respondida por el testigo.', note: null },
+    especulativa: { label: 'Pregunta especulativa', say: 'Objeción, señoría: la pregunta es especulativa, pide al testigo suponer sobre hechos que no le constan.', note: null }
 };
 
 const QUESTION_CATEGORIES = ['aclarar', 'precisar', 'verificar', 'cuestionar', 'profundizar'];
@@ -509,87 +500,99 @@ const isDuplicateAlert = (alert, history) =>
             similarity(previous.compareText, alert.compareText) >= 0.6
     );
 
-// =================== Gestor de concurrencia del LLM ===================
-const llmMutex = {
-    current: Promise.resolve(),
-    lock() {
-        let release;
-        const next = new Promise(resolve => { release = resolve; });
-        const wait = this.current;
-        this.current = wait.then(() => next, () => next);
-        return { wait, release };
+
+// =================== Interfaz con Groq ===================
+// Extrae un objeto JSON de un texto aunque venga con basura alrededor (```json ... ```, texto previo, etc.)
+const extractJson = (raw = '') => {
+    const text = String(raw).trim();
+    if (!text) return null;
+
+    try {
+        return JSON.parse(text);
+    } catch { /* se intenta extraer a mano */ }
+
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start === -1 || end <= start) return null;
+
+    try {
+        return JSON.parse(text.slice(start, end + 1));
+    } catch {
+        return null;
     }
 };
 
-const streamFromLLM = async ({ model = LLM_CONFIG.model, messages, numPredict, temperature = 0.2 }, onObject) => {
-    const { wait, release } = llmMutex.lock();
-    await wait;
+const isJsonValidateError = (error) =>
+    error?.status === 400 &&
+    (error?.error?.error?.code === 'json_validate_failed' ||
+        String(error?.message || '').includes('json_validate_failed'));
 
-    let stream = null;
-    let timer;
-    let timedOut = false;
-
-    const timeout = new Promise((_, reject) => {
-        timer = setTimeout(() => {
-            timedOut = true;
-            if (stream?.abort) stream.abort();
-            reject(new Error('Tiempo de espera agotado en Ollama'));
-        }, LLM_CONFIG.timeoutMs);
-    });
-    timeout.catch(() => { });
-
-    const call = ollama.chat({
+// Una sola llamada a Groq. `strictJson` activa el modo JSON nativo; si falla se reintenta sin él.
+const callGroq = async ({ model, messages, maxTokens, temperature, strictJson }) => {
+    const request = {
         model,
         messages,
-        stream: true,
-        // think: false,
-        keep_alive: LLM_CONFIG.keepAlive,
-        options: {
-            temperature,
-            top_p: 0.9,
-            repeat_penalty: 1.1,
-            num_ctx: LLM_CONFIG.numCtx,
-            num_predict: numPredict,
-            num_thread: 1,
-        }
-    });
-    call.catch(() => { });
+        temperature,
+        max_completion_tokens: maxTokens,
+        reasoning_effort: LLM_CONFIG.reasoningEffort, // gpt-oss: low | medium | high
+        include_reasoning: false,                     // no devolver el razonamiento, solo la respuesta
+        stream: false
+    };
 
-    let full = '';
-    let buffer = '';
+    if (strictJson) request.response_format = { type: 'json_object' };
 
-    try {
-        stream = await Promise.race([call, timeout]);
+    const completion = await groq.chat.completions.create(request, { timeout: LLM_CONFIG.timeoutMs });
+    const choice = completion.choices?.[0];
 
-        for await (const part of stream) {
-            const chunk = part?.message?.content || '';
-            if (!chunk) continue;
-
-            full += chunk;
-            buffer += chunk;
-
-            let match;
-            while ((match = /\{[^{}]*\}/.exec(buffer))) {
-                buffer = buffer.slice(match.index + match[0].length);
-
-                let parsed = null;
-                try {
-                    parsed = JSON.parse(match[0]);
-                } catch {
-                }
-
-                if (parsed && onObject) await onObject(parsed);
-            }
-        }
-    } catch (error) {
-        if (timedOut) throw new Error('Tiempo de espera agotado en Ollama');
-        throw error;
-    } finally {
-        clearTimeout(timer);
-        release();
+    if (choice?.finish_reason === 'length') {
+        console.warn(`[GROQ] ${model}: la respuesta se cortó por max_tokens (${maxTokens}). Sube el límite si se repite.`);
     }
 
-    return full.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+    return choice?.message?.content || '';
+};
+
+const streamFromLLM = async ({ model = LLM_CONFIG.model, messages, maxTokens, temperature = 0.2 }, onObject) => {
+    let content = '';
+
+    try {
+        try {
+            // Intento 1: modo JSON estricto de Groq
+            content = await callGroq({ model, messages, maxTokens, temperature, strictJson: true });
+        } catch (error) {
+            if (!isJsonValidateError(error)) throw error;
+
+            // Intento 2: Groq rechazó la generación como JSON inválido (típicamente porque quedó vacía
+            // o truncada). Se reintenta sin modo estricto, con más margen de tokens, y se extrae el JSON a mano.
+            console.warn(`[GROQ] json_validate_failed en ${model}. Reintentando en modo flexible...`);
+            content = await callGroq({
+                model,
+                messages,
+                maxTokens: Math.round(maxTokens * 1.5),
+                temperature,
+                strictJson: false
+            });
+        }
+    } catch (error) {
+        console.error('[GROQ ERROR]:', error?.status || '', error?.error?.error?.message || error?.message || error);
+        throw new Error('Fallo en la comunicación con Groq');
+    }
+
+    const parsed = extractJson(content);
+
+    if (!parsed || typeof parsed !== 'object') {
+        console.error('[GROQ ERROR] La respuesta no contiene JSON válido:', JSON.stringify(content).slice(0, 300));
+        throw new Error('Groq devolvió una respuesta sin JSON válido');
+    }
+
+    // Desempaquetar según el tipo de respuesta (arrays envueltos en objetos o pregunta única)
+    if (Array.isArray(parsed.objeciones)) {
+        for (const item of parsed.objeciones) await onObject(item);
+    } else if (Array.isArray(parsed.hallazgos)) {
+        for (const item of parsed.hallazgos) await onObject(item);
+    } else if (Object.keys(parsed).length > 0) {
+        // Es el carril de preguntas generadas
+        await onObject(parsed);
+    }
 };
 
 // =================== Motor del asistente en vivo ===================
@@ -622,7 +625,7 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
         if (heavyInFlight > 0) {
             status = { state: 'thinking', message: 'Analizando lo último que se dijo...' };
         } else if (hasError) {
-            status = { state: 'error', message: 'El modelo local no respondió. Verifica que Ollama esté en ejecución.' };
+            status = { state: 'error', message: 'Hubo un error al procesar con la IA.' };
         } else if (questionOutcome === 'no_context') {
             status = { state: 'no_context', message: 'Aún no hay contexto suficiente para sugerir preguntas.' };
         } else {
@@ -689,19 +692,17 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
 
             await streamFromLLM(
                 {
-                    model: LLM_CONFIG.fastModel,
-                    numPredict: cfg.numPredict,
+                    model: LLM_CONFIG.fastModel, // Usamos el modelo rápido de 8B
+                    maxTokens: cfg.maxTokens,
                     temperature: cfg.temperature,
                     messages: [
                         { role: 'system', content: prompts.objections },
                         ...OBJECTIONS_FEW_SHOT,
-                        {
-                            role: 'user',
-                            content: buildObjectionsPrompt({ caseName, caseDescription, lastTurn })
-                        }
+                        { role: 'user', content: buildObjectionsPrompt({ caseName, caseDescription, lastTurn }) }
                     ]
                 },
                 async (obj) => {
+                    // Groq devolverá los objetos dentro del array uno por uno
                     if (!isActive || count >= cfg.maxPerTurn) return;
 
                     const alert = parseObjection(obj);
@@ -738,15 +739,13 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
 
             await streamFromLLM(
                 {
-                    numPredict: cfg.numPredict,
+                    model: LLM_CONFIG.model, // Usamos el modelo inteligente de 70B
+                    maxTokens: cfg.maxTokens,
                     temperature: cfg.temperature,
                     messages: [
                         { role: 'system', content: prompts.insights },
                         ...INSIGHTS_FEW_SHOT,
-                        {
-                            role: 'user',
-                            content: buildInsightsPrompt({ caseName, caseDescription, history, reported, newText })
-                        }
+                        { role: 'user', content: buildInsightsPrompt({ caseName, caseDescription, history, reported, newText }) }
                     ]
                 },
                 async (obj) => {
@@ -782,26 +781,24 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
             let emitted = false;
             let sawDuplicate = false;
 
-            const raw = await streamFromLLM(
+            await streamFromLLM(
                 {
-                    numPredict: cfg.numPredict,
+                    model: LLM_CONFIG.model, // Usamos el modelo inteligente de 70B
+                    maxTokens: cfg.maxTokens,
                     temperature: cfg.temperature,
                     messages: [
                         { role: 'system', content: prompts.questions },
                         ...QUESTIONS_FEW_SHOT,
-                        {
-                            role: 'user',
-                            content: buildQuestionsPrompt({
-                                caseName,
-                                caseDescription,
-                                askedQuestions: askedMain.slice(-cfg.maxHistory),
-                                newText
-                            })
-                        }
+                        { role: 'user', content: buildQuestionsPrompt({ caseName, caseDescription, askedQuestions: askedMain.slice(-cfg.maxHistory), newText }) }
                     ]
                 },
                 async (obj) => {
                     if (!isActive || emitted) return;
+
+                    // Si el modelo decide que no hay contexto suficiente
+                    if (obj.q === LLM_CONFIG.noContextToken || obj.q?.includes(LLM_CONFIG.noContextToken)) {
+                        return; // Se deja emitted en false para que pase a estado "no_context"
+                    }
 
                     const result = parseQuestion(obj, askedAll);
 
@@ -831,7 +828,6 @@ const createAssistantEngine = ({ tipo, caseName, caseDescription, onStatus, onQu
                 questionCursor = snapshot;
             } else {
                 questionOutcome = 'no_context';
-                console.log('[IA] Sin pregunta útil. Respuesta cruda:', JSON.stringify(raw));
             }
         }
     });
@@ -1452,27 +1448,86 @@ app.get('/api/sessions/:id', authenticate, async (req, res) => {
     }
 });
 
-app.get('/api/llm/health', authenticate, requireAdmin, async (req, res) => {
-    const start = Date.now();
+app.get('/api/test-groq', async (req, res) => {
 
     try {
-        const response = await streamFromLLM({
-            messages: [{ role: 'user', content: 'Responde únicamente con la palabra: ok' }],
-            numPredict: 10,
-            temperature: 0
+
+        console.log('[GROQ TEST] Iniciando prueba...');
+
+        const response = await groq.chat.completions.create({
+
+            model: LLM_CONFIG.model,
+
+            messages: [
+                {
+                    role: 'system',
+                    content: `
+                        Eres un asistente que genera preguntas.
+
+                        Debes responder exclusivamente en formato JSON.
+
+                        La respuesta debe ser siempre un objeto JSON.
+                        Nunca devuelvas un arreglo como respuesta principal.
+
+                        Utiliza obligatoriamente esta estructura:
+
+                        {
+                            "preguntas": [
+                                {
+                                    "pregunta": "Texto de la pregunta"
+                                }
+                            ]
+                        }
+                    `
+                },
+                {
+                    role: 'user',
+                    content: `
+                        Analiza el siguiente caso:
+
+                        Una persona manifiesta que el día 10 de noviembre
+                        de 2026 realizó un contrato de compraventa de un
+                        vehículo. Posteriormente, el comprador indica
+                        que el vehículo presentó fallas mecánicas.
+
+                        Genera tres preguntas relevantes sobre este caso.
+                    `
+                }
+            ],
+
+            temperature: 0.2,
+            max_tokens: 500,
+
+            response_format: {
+                type: 'json_object'
+            }
+
         });
 
-        res.json({
+        const content = response.choices[0].message.content;
+
+        const parsed = JSON.parse(content);
+
+        console.log('[GROQ TEST] Respuesta:', parsed);
+
+        return res.json({
             success: true,
             model: LLM_CONFIG.model,
-            duration_ms: Date.now() - start,
-            response: response.trim()
+            response: parsed
         });
 
     } catch (error) {
-        console.error('[BACKEND] Ollama no disponible:', error.message);
-        res.status(500).json({ success: false, model: LLM_CONFIG.model, error: error.message });
+
+        console.error('[GROQ TEST ERROR]:', error);
+
+        return res.status(500).json({
+            success: false,
+            error: error.message,
+            details: error.error || null
+        });
+
     }
+
 });
 
 // =================== 5. SERVIDOR HTTP Y WEBSOCKETS ===================
@@ -1662,7 +1717,7 @@ io.on('connection', (socket) => {
             deepgramLive.connect();
             await deepgramLive.waitForOpen();
 
-            console.log(`[IA] Asistente activo (${caseInfo.tipo}). Modelo: ${LLM_CONFIG.model}`);
+            console.log(`[IA] Asistente activo (${caseInfo.tipo}). Modelo Groq.`);
 
         } catch (error) {
             console.error('[BACKEND] Error iniciando la sesión:', error.message || error);
