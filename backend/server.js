@@ -561,7 +561,7 @@ const streamFromLLM = async ({ model = LLM_CONFIG.model, messages, numPredict, t
         model,
         messages,
         stream: true,
-        think: false,
+        think: true,
         keep_alive: LLM_CONFIG.keepAlive,
         options: {
             temperature,
@@ -569,7 +569,7 @@ const streamFromLLM = async ({ model = LLM_CONFIG.model, messages, numPredict, t
             repeat_penalty: 1.1,
             num_ctx: LLM_CONFIG.numCtx,
             num_predict: numPredict,
-            num_thread: 2, // Optimización crítica: forzar exactamente 2 hilos para usar el CPU eficientemente
+            num_thread: 1, // Optimización crítica: forzar exactamente 2 hilos para usar el CPU eficientemente
         }
     });
     call.catch(() => { });
